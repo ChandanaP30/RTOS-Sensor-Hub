@@ -1,0 +1,18 @@
+# PlatformIO build output
+.pio/
+
+# VS Code local settings
+.vscode/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Wokwi VS Code local state
+.wokwi/
+
+# macOS
+.DS_Store
+
+# Windows
+Thumbs.db

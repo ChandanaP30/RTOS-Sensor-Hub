@@ -1,0 +1,39 @@
+{
+  "version": 1,
+  "author": "RTOS Sensor Hub Project",
+  "editor": "wokwi",
+  "parts": [
+    {
+      "type": "wokwi-esp32-devkit-v1",
+      "id":   "esp",
+      "top":  0,
+      "left": 0,
+      "attrs": {}
+    },
+    {
+      "type": "wokwi-dht22",
+      "id":   "dht1",
+      "top":  80,
+      "left": 300,
+      "attrs": {
+        "temperature": "25.5",
+        "humidity":    "60.0"
+      }
+    },
+    {
+      "type": "wokwi-resistor",
+      "id":   "r1",
+      "top":  60,
+      "left": 215,
+      "attrs": { "value": "10000" },
+      "rotate": 90
+    }
+  ],
+  "connections": [
+    ["esp:GND.1", "dht1:GND",  "black",  []],
+    ["esp:3V3",   "dht1:VCC",  "red",    []],
+    ["esp:D4",    "dht1:SDA",  "green",  []],
+    ["esp:3V3",   "r1:1",      "red",    []],
+    ["r1:2",      "dht1:SDA",  "green",  []]
+  ]
+}
