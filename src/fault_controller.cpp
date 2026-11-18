@@ -14,12 +14,19 @@
 // Available commands and what they do:
 //   HELP          — print the command list
 //   STATUS        — print current fault flag states and counters
-//   SENSOR_STOP   — set g_fault_sensor_stop = true  (heartbeat freezes)
+//   SENSOR_STOP   — set g_fault_sensor_stop = true
+//                   The sensor task continues looping but skips both its
+//                   heartbeat update and its Queue A send.  This simulates
+//                   a task that is alive but no longer doing useful work.
 //   SENSOR_RESUME — clear g_fault_sensor_stop
-//   SENSOR_SLOW   — set g_fault_sensor_slow = true  (adds 3 s delay)
+//   SENSOR_SLOW   — set g_fault_sensor_slow = true
+//                   Inserts SLOW_SENSOR_EXTRA_DELAY_MS (3 s) before each
+//                   sensor cycle, then resets the timing reference so the
+//                   next period is a full SENSOR_PERIOD_MS (1 s) after the
+//                   delay.  Effective period: ~4 s.
 //   SENSOR_NORMAL — clear g_fault_sensor_slow
-//   INVALID_DATA  — set g_fault_invalid_data = true (force NaN readings)
-//   QUEUE_STRESS  — set g_fault_queue_stress = true (burst-fill queue)
+//   INVALID_DATA  — toggle g_fault_invalid_data (force NaN readings)
+//   QUEUE_STRESS  — toggle g_fault_queue_stress (burst-fill Queue A)
 //   RESET_FAULTS  — clear all fault flags at once
 //
 // FreeRTOS concepts:
@@ -33,18 +40,24 @@
 
 // ---------------------------------------------------------------------------
 // Helper: push a text message to Queue B (Logger).
-// Same helper pattern used in supervisor_task.cpp.
+//
+// FaultCmdTask runs at the lowest application priority (1), so it is safe to
+// block here for a brief period — higher-priority tasks (Logger at priority 2)
+// will preempt this task and drain Queue B during the wait.  A timeout of
+// 100 ms is long enough for the Logger to free at least one slot under any
+// realistic load.
+//
+// If Queue B is still full after 100 ms, the message is dropped silently.
+// We do NOT fall back to Serial.print() because LoggerTask is the sole owner
+// of Serial; a direct write here would race with the logger and produce
+// garbled output on the UART.
 // ---------------------------------------------------------------------------
 static void cmdReport(const char* text) {
     LogMessage msg;
     msg.timestamp_ms = millis();
     snprintf(msg.text, LOG_MSG_LEN, "%s", text);
-    // Tolerate a short block — this is a low-priority task
-    if (xQueueSend(g_queue_b, &msg, MS_TO_TICKS(100)) != pdTRUE) {
-        // Fallback: direct Serial
-        Serial.print(F("[CMD-DIRECT] "));
-        Serial.println(text);
-    }
+    // Block up to 100 ms; drop silently if queue remains full.
+    xQueueSend(g_queue_b, &msg, MS_TO_TICKS(100));
 }
 
 // ---------------------------------------------------------------------------
@@ -55,7 +68,7 @@ static void printHelp() {
     cmdReport(" AVAILABLE COMMANDS:");
     cmdReport("  HELP          - Show this help");
     cmdReport("  STATUS        - Show fault flags and counters");
-    cmdReport("  SENSOR_STOP   - Stop sensor heartbeat (simulate task hang)");
+    cmdReport("  SENSOR_STOP   - Stop heartbeat + data send (simulate hung task)");
     cmdReport("  SENSOR_RESUME - Resume sensor heartbeat");
     cmdReport("  SENSOR_SLOW   - Add 3s delay to sensor updates");
     cmdReport("  SENSOR_NORMAL - Remove sensor delay");
@@ -136,8 +149,10 @@ static void processCommand(const String& cmd) {
 
     } else if (cmd == "SENSOR_STOP") {
         g_fault_sensor_stop = true;
-        cmdReport("[CMD] SENSOR_STOP activated — sensor heartbeat will freeze.");
-        cmdReport("      Watch for supervisor fault report in ~3 seconds.");
+        cmdReport("[CMD] SENSOR_STOP activated.");
+        cmdReport("      Sensor heartbeat AND queue sends are now suppressed.");
+        cmdReport("      Task is alive but doing no useful work.");
+        cmdReport("      Supervisor fault expected in ~3 s.");
 
     } else if (cmd == "SENSOR_RESUME") {
         g_fault_sensor_stop = false;
@@ -145,8 +160,9 @@ static void processCommand(const String& cmd) {
 
     } else if (cmd == "SENSOR_SLOW") {
         g_fault_sensor_slow = true;
-        cmdReport("[CMD] SENSOR_SLOW activated — 3s extra delay added to sensor.");
-        cmdReport("      Sensor period becomes ~4s; timeout is 3s, fault expected.");
+        cmdReport("[CMD] SENSOR_SLOW activated — 3 s extra delay per sensor cycle.");
+        cmdReport("      Effective period: ~4 s (3 s delay + 1 s normal period).");
+        cmdReport("      Supervisor timeout is 3 s — fault will be reported.");
 
     } else if (cmd == "SENSOR_NORMAL") {
         g_fault_sensor_slow = false;

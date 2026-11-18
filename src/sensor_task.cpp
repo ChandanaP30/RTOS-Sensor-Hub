@@ -12,6 +12,24 @@
 //   • vTaskDelayUntil()  — strict periodic execution (not just "sleep 1 s")
 //   • xQueueSend()       — non-blocking queue write (timeout = 0)
 //   • Heartbeat pattern  — simple timestamp updated each cycle
+//
+// Fault injection behaviour (important):
+//   SENSOR_STOP — the task continues looping at its normal rate but skips
+//     both the heartbeat update and the queue send.  This simulates a task
+//     that is alive (not crashed, not in an infinite loop) but has stopped
+//     doing useful work.  The supervisor detects the missing heartbeat.
+//     Data flow into Queue A also stops; the processing task will see no
+//     new readings during this period.
+//
+//   SENSOR_SLOW — a vTaskDelay(SLOW_SENSOR_EXTRA_DELAY_MS) is inserted
+//     before the heartbeat update and queue send.  After this extra delay,
+//     lastWakeTime is reset to the current tick so that the subsequent
+//     vTaskDelayUntil() correctly waits a full SENSOR_PERIOD_MS before
+//     the next cycle.  Total effective period = SLOW_SENSOR_EXTRA_DELAY_MS
+//     + SENSOR_PERIOD_MS (nominally 3000 + 1000 = 4000 ms).  Without
+//     resetting lastWakeTime the vTaskDelayUntil deadline would already be
+//     in the past and the task would spin immediately, making the period
+//     unpredictable.
 // =============================================================================
 
 #include <Arduino.h>
@@ -43,26 +61,55 @@ void sensorTask(void* pvParameters) {
 
         // ------------------------------------------------------------------
         // Fault injection: SENSOR_SLOW
-        // Add an extra delay BEFORE the heartbeat update so the supervisor
-        // can detect that the task is running but slower than expected.
-        // We use vTaskDelay() (not a busy-wait) so other tasks still run.
+        //
+        // Insert a blocking delay BEFORE the heartbeat and queue send so the
+        // supervisor can detect that the task is running but slower than its
+        // configured deadline.  vTaskDelay() yields the CPU — other tasks
+        // run normally during this wait.
+        //
+        // After the extra delay we MUST reset lastWakeTime to the current
+        // tick.  Without this reset, the subsequent vTaskDelayUntil() would
+        // find that its deadline (lastWakeTime + SENSOR_PERIOD_MS) is already
+        // in the past and return immediately, causing the task to spin several
+        // times before its timing grid re-synchronises.  Resetting ensures
+        // the next period is a predictable SENSOR_PERIOD_MS from now.
+        //
+        // Effective total period in slow mode:
+        //   SLOW_SENSOR_EXTRA_DELAY_MS + SENSOR_PERIOD_MS = ~4000 ms
         // ------------------------------------------------------------------
         if (g_fault_sensor_slow) {
             vTaskDelay(MS_TO_TICKS(SLOW_SENSOR_EXTRA_DELAY_MS));
+            // Re-anchor the periodic grid so vTaskDelayUntil is not stale
+            lastWakeTime = xTaskGetTickCount();
         }
 
         // ------------------------------------------------------------------
         // Fault injection: SENSOR_STOP
-        // Simply skip the heartbeat update this cycle.
-        // The task is NOT killed — it keeps looping at normal speed.
-        // The supervisor will notice that last_beat_ms is not updating.
+        //
+        // Skip BOTH the heartbeat update AND the queue send this cycle.
+        // The task is NOT killed — it continues looping at its normal rate.
+        // This simulates a task that is alive but has stopped doing useful
+        // work (e.g., stuck waiting on a peripheral that never responds).
+        //
+        // Effect on the system:
+        //   • g_hb_sensor.last_beat_ms stays frozen → supervisor detects fault.
+        //   • No new SensorData is pushed to Queue A → processing task sees
+        //     no readings while SENSOR_STOP is active.
+        //
+        // These two effects are intentional and consistent: a "stopped" task
+        // neither reports its health nor produces output.
         // ------------------------------------------------------------------
-        if (!g_fault_sensor_stop) {
-            // Normal operation — beat the heartbeat
-            g_hb_sensor.last_beat_ms = millis();
-            g_hb_sensor.beat_count++;
+        if (g_fault_sensor_stop) {
+            // Skip heartbeat and data send; just wait for the next period
+            vTaskDelayUntil(&lastWakeTime, MS_TO_TICKS(SENSOR_PERIOD_MS));
+            continue;
         }
-        // If SENSOR_STOP: heartbeat stays frozen while the task keeps running.
+
+        // ------------------------------------------------------------------
+        // Normal operation: update heartbeat
+        // ------------------------------------------------------------------
+        g_hb_sensor.last_beat_ms = millis();
+        g_hb_sensor.beat_count++;
 
         // ------------------------------------------------------------------
         // Read the sensor

@@ -91,8 +91,19 @@ constexpr uint32_t LOGGER_HEARTBEAT_TIMEOUT_MS     = 1000;  // 5× normal period
 
 // ---------------------------------------------------------------------------
 // Fault injection parameters
+//
+// SLOW_SENSOR_EXTRA_DELAY_MS:
+//   Extra blocking delay inserted at the START of each sensor cycle when
+//   SENSOR_SLOW is active.  After this delay, sensor_task.cpp resets
+//   lastWakeTime so that vTaskDelayUntil() correctly waits a further
+//   SENSOR_PERIOD_MS before the next iteration.
+//   Effective total period in slow mode:
+//     SLOW_SENSOR_EXTRA_DELAY_MS + SENSOR_PERIOD_MS = 3000 + 1000 = 4000 ms
+//   The supervisor timeout for the sensor is SENSOR_HEARTBEAT_TIMEOUT_MS
+//   (3000 ms), so a fault is expected to be reported after the first missed
+//   deadline.
 // ---------------------------------------------------------------------------
-constexpr uint32_t SLOW_SENSOR_EXTRA_DELAY_MS = 3000; // Added delay when SENSOR_SLOW
+constexpr uint32_t SLOW_SENSOR_EXTRA_DELAY_MS = 3000; // Extra delay in SENSOR_SLOW mode
 constexpr uint32_t QUEUE_STRESS_BURST         = 20;   // Items pushed rapidly during QUEUE_STRESS
 
 // ---------------------------------------------------------------------------
@@ -120,8 +131,30 @@ struct LogMessage {
 
 // ---------------------------------------------------------------------------
 // Heartbeat record — one per monitored task
-// volatile: the compiler must not cache this in a register because it is
-// written by one task and read by another.
+//
+// Synchronisation model:
+//   All five tasks are pinned to Core 1 (see xTaskCreatePinnedToCore in
+//   main.cpp).  On a single core, the FreeRTOS preemptive scheduler ensures
+//   only one task executes at a time — there is no true parallel execution.
+//   Therefore:
+//     • 32-bit reads and writes cannot be "torn" (interrupted mid-operation).
+//     • No CPU cache-coherency issue exists between tasks on the same core.
+//
+//   The 'volatile' qualifier is still necessary here.  Without it the compiler
+//   is free to keep last_beat_ms in a CPU register across loop iterations and
+//   never re-read it from SRAM.  'volatile' forces every access to go to
+//   actual memory, ensuring that a write in one task is visible to any task
+//   that is later scheduled on the same core.
+//
+//   'volatile' is NOT a general substitute for a mutex.  It is sufficient
+//   here because:
+//     a) All tasks run on Core 1 (single-core scheduling).
+//     b) No ISR accesses these records.
+//     c) The only operation performed is a single 32-bit store (write) or
+//        load (read) — no compound read-modify-write that would need atomicity.
+//
+//   If any task were moved to Core 0, or if an ISR updated these fields,
+//   a portENTER_CRITICAL() / portEXIT_CRITICAL() section would be required.
 // ---------------------------------------------------------------------------
 struct HeartbeatRecord {
     volatile uint32_t last_beat_ms;   // millis() of the most recent heartbeat
@@ -132,9 +165,14 @@ struct HeartbeatRecord {
 // ---------------------------------------------------------------------------
 // Global fault injection flags
 // Declared extern here; defined once in main.cpp.
-// volatile: written by FaultCmdTask, read by SensorTask.
+//
+// Synchronisation: same single-core model as HeartbeatRecord above.
+// FaultCmdTask writes these flags; SensorTask and ProcessingTask read them.
+// All tasks are on Core 1 — no parallel execution, no torn reads possible.
+// 'volatile' prevents the compiler from caching the value in a register and
+// missing a write from another task.  No mutex is required.
 // ---------------------------------------------------------------------------
-extern volatile bool g_fault_sensor_stop;    // stop sensor heartbeat
+extern volatile bool g_fault_sensor_stop;    // stop heartbeat AND queue send
 extern volatile bool g_fault_sensor_slow;    // add extra delay to sensor
 extern volatile bool g_fault_invalid_data;   // force NaN readings
 extern volatile bool g_fault_queue_stress;   // burst-fill the queue
@@ -154,7 +192,16 @@ extern QueueHandle_t g_queue_a;   // SensorData:   Sensor → Processing
 extern QueueHandle_t g_queue_b;   // LogMessage:   Processing → Logger
 
 // ---------------------------------------------------------------------------
-// Global counters (atomic-safe on ESP32 for 32-bit types read/written once)
+// Global counters
+//
+// Synchronisation: same single-core model — volatile prevents register
+// caching; the increment (++) is a compound read-modify-write.  On a single
+// core with preemptive scheduling, this is safe as long as we accept the
+// (theoretical) risk that a preemption occurs between the read and write.
+// In practice this would only miscalculate a count by 1 in an edge case;
+// the counter never resets, so the value is always monotonically correct
+// for fault reporting purposes.  A portENTER_CRITICAL() section would
+// eliminate even this theoretical risk if strict accuracy were required.
 // ---------------------------------------------------------------------------
 extern volatile uint32_t g_queue_a_overflow_count;
 extern volatile uint32_t g_queue_b_overflow_count;

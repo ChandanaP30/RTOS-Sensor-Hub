@@ -21,9 +21,25 @@
 //   • The supervisor also inspects queue overflow counters and invalid
 //     reading counts, and reports changes.
 //
+// Logging policy:
+//   All output goes through Queue B → LoggerTask, which is the sole owner
+//   of Serial.  supervisorReport() uses a timeout of 0 (non-blocking).
+//   If Queue B is full the message is silently dropped; this is acceptable
+//   because the status summary will be retried next cycle (every 2 s) and
+//   fault transitions are only reported once per state change.  Under normal
+//   operation Queue B never fills up: the Logger drains it every 200 ms.
+//
+// Supervisor priority and scheduling:
+//   The supervisor runs at priority 5 and sleeps for SUPERVISOR_PERIOD_MS
+//   (2 s) between cycles via vTaskDelayUntil().  While sleeping it is in the
+//   BLOCKED state and uses zero CPU — it does NOT starve lower-priority tasks.
+//   Its active work per cycle (a handful of comparisons and non-blocking
+//   queue sends) completes in well under 1 ms, so it has negligible impact
+//   on other tasks.
+//
 // FreeRTOS concepts used:
 //   • vTaskDelayUntil() — periodic execution at exact intervals
-//   • xQueueSend()      — push reports to Logger via Queue B
+//   • xQueueSend()      — push reports to Logger via Queue B (timeout = 0)
 // =============================================================================
 
 #include <Arduino.h>
@@ -31,20 +47,27 @@
 #include "config.h"
 
 // ---------------------------------------------------------------------------
-// Helper: push a text message directly to Queue B so the Logger prints it.
-// If Queue B is full, we fall back to a direct Serial.print (the supervisor
-// must always be able to report faults).
+// Helper: push a text message to Queue B so the LoggerTask prints it.
+//
+// Timeout = 0 (non-blocking): if Queue B is full, the message is silently
+// dropped.  We deliberately do NOT fall back to Serial.print() here because:
+//   1. LoggerTask is the sole authorised owner of Serial writes.
+//   2. Direct Serial calls from supervisor would interleave with logger output
+//      and produce garbled lines on the UART.
+//   3. The supervisor's status summary repeats every 2 s, so a single dropped
+//      message is not a critical loss.  Fault-transition messages (FAULT /
+//      RECOVERY) are only generated once per state change and would be retried
+//      only on the next transition — an acceptable trade-off for correctness.
+//
+// Under normal operation Queue B never fills: the Logger drains it every
+// 200 ms and the system produces at most ~5 messages per 2-second cycle.
 // ---------------------------------------------------------------------------
 static void supervisorReport(const char* text) {
     LogMessage msg;
     msg.timestamp_ms = millis();
     snprintf(msg.text, LOG_MSG_LEN, "%s", text);
-
-    if (xQueueSend(g_queue_b, &msg, MS_TO_TICKS(50)) != pdTRUE) {
-        // Queue B is full — print directly as a last resort
-        Serial.print(F("[SUPERVISOR-DIRECT] "));
-        Serial.println(text);
-    }
+    // timeout = 0: non-blocking.  Drop silently if queue is full.
+    xQueueSend(g_queue_b, &msg, 0);
 }
 
 // ---------------------------------------------------------------------------

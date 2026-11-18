@@ -226,8 +226,17 @@ Supervisor reads: age = millis() - g_hb_sensor.last_beat_ms;
                   if (age > 3000) → FAULT detected
 ```
 
-### 6. `volatile` Keyword
-When one task writes a flag and another reads it, the compiler might optimise by caching the value in a CPU register. `volatile` tells the compiler: "always read this from memory, never cache it." This prevents subtle bugs where a task never sees a flag change.
+### 6. `volatile` Keyword and Synchronisation
+
+`volatile` tells the compiler "always read this variable from memory, never cache it in a CPU register." Without it the compiler is free to read a flag once and never re-read it, so a write by another task would go unnoticed.
+
+**Why `volatile` is sufficient here (but not in general):**
+All five tasks in this project are pinned to **Core 1** (`xTaskCreatePinnedToCore(..., 1)`). On a single core, FreeRTOS's preemptive scheduler guarantees that only one task runs at a time — there is no true parallel execution. This means:
+- 32-bit reads and writes cannot be interrupted mid-operation ("torn").
+- There is no CPU cache-coherency problem between tasks sharing the same core.
+- `volatile` alone is enough to prevent compiler register-caching.
+
+**`volatile` does NOT guarantee thread safety in general.** If any task were moved to Core 0, or if an ISR modified these variables, a `portENTER_CRITICAL()` / `portEXIT_CRITICAL()` section or a FreeRTOS mutex would be required. The comments in `config.h` explain this in detail.
 
 ### 7. Queue Overflow Detection
 `xQueueSend(queue, data, 0)` with timeout=0 returns `pdFALSE` immediately if the queue is full. We count these failures instead of blocking, which prevents priority inversion.
@@ -332,9 +341,9 @@ Open the Serial Monitor at **115200 baud**. Type any command and press Enter.
 |---------|-------------|-----------------|
 | `HELP` | Shows all commands | Command list printed |
 | `STATUS` | Shows current fault flags and counters | Current system state printed |
-| `SENSOR_STOP` | Freezes the sensor heartbeat | Supervisor detects fault within ~3 s |
-| `SENSOR_RESUME` | Restores sensor heartbeat | Supervisor reports recovery |
-| `SENSOR_SLOW` | Adds 3 s delay to sensor task | Sensor period becomes ~4 s, fault detected |
+| `SENSOR_STOP` | Freezes sensor heartbeat **and** stops Queue A sends | Supervisor detects fault within ~3 s; sensor readings also stop |
+| `SENSOR_RESUME` | Restores sensor heartbeat and data flow | Supervisor reports recovery |
+| `SENSOR_SLOW` | Adds 3 s delay → effective period ~4 s | Fault detected (3 s timeout); recovery when cycle completes |
 | `SENSOR_NORMAL` | Removes the delay | Normal 1 s period resumes |
 | `INVALID_DATA` | Toggles NaN sensor readings | Processing Task reports DATA-ERR |
 | `QUEUE_STRESS` | Toggles burst-filling of Queue A | Queue overflows reported immediately |
@@ -370,16 +379,25 @@ Type HELP for available commands.
 
 **Procedure:** Type `SENSOR_STOP` in Serial Monitor.
 
+**What SENSOR_STOP actually does:**
+The sensor task continues looping at its normal 1 s rate but skips **both** the heartbeat update and the `xQueueSend()` call. The task is alive (not crashed, no infinite loop) but completely idle — it neither reports its health nor produces data. This models a task blocked on a peripheral that never responds.
+
 **Expected output (within 3–5 seconds):**
 ```
 [   5200ms] [INPUT] Received: SENSOR_STOP
-[   5201ms] [CMD] SENSOR_STOP activated — sensor heartbeat will freeze.
-[   5202ms]       Watch for supervisor fault report in ~3 seconds.
+[   5201ms] [CMD] SENSOR_STOP activated.
+[   5202ms]       Sensor heartbeat AND queue sends are now suppressed.
+[   5203ms]       Task is alive but doing no useful work.
+[   5204ms]       Supervisor fault expected in ~3 s.
 [   8000ms] [SUPER] t=8000ms | Sensor:FAIL Processing:OK Logger:OK | ...
 [   8001ms] [FAULT] *** SensorTask UNRESPONSIVE! Last beat 3100ms ago (timeout=3000ms) ***
 ```
 
-**What to observe:** Only the Sensor heartbeat stops. Processing and Logger continue running normally. Sensor readings stop appearing (Queue A empties), but the supervisor summary still prints every 2 seconds.
+**What to observe:**
+- Sensor readings **stop** appearing (Queue A receives nothing while SENSOR_STOP is active).
+- Processing and Logger tasks continue running normally.
+- The supervisor summary still prints every 2 seconds.
+- Two distinct problems are visible: missing heartbeat **and** missing data — both caused by the same flag.
 
 **Type `SENSOR_RESUME` to clear:**
 ```
@@ -390,10 +408,16 @@ Type HELP for available commands.
 
 **Procedure:** Type `SENSOR_SLOW`.
 
+**What SENSOR_SLOW actually does (corrected timing):**
+`vTaskDelay(3000)` runs first — yielding the CPU for 3 s. Then `lastWakeTime` is reset to the current tick. Then `vTaskDelayUntil(1000)` sleeps a further 1 s. Total effective period: **~4 s**.
+
+Without the `lastWakeTime` reset, `vTaskDelayUntil` would find its deadline already 2 s in the past and return immediately, causing the task to spin several times before re-synchronising. The reset makes the period predictable.
+
 **Expected output:**
 ```
-[CMD] SENSOR_SLOW activated — 3s extra delay added to sensor.
-      Sensor period becomes ~4s; timeout is 3s, fault expected.
+[CMD] SENSOR_SLOW activated — 3 s extra delay per sensor cycle.
+      Effective period: ~4 s (3 s delay + 1 s normal period).
+      Supervisor timeout is 3 s — fault will be reported.
 [FAULT] *** SensorTask UNRESPONSIVE! Last beat 3200ms ago (timeout=3000ms) ***
 ```
 
@@ -478,8 +502,9 @@ All measurements are based on actual program state variables, not hardcoded valu
 
 | Limitation | Explanation | Workaround |
 |-----------|-------------|------------|
-| No mutex around Serial | Only LoggerTask calls `Serial.println()` for normal logs, so no race condition. The supervisor uses `Serial.print()` as a last-resort fallback only when Queue B is full. | Use Queue B for all logging |
-| `volatile` not `atomic` | On ESP32 (Xtensa LX6, 32-bit), 32-bit variable reads/writes are atomic by hardware. For multi-word reads, use a mutex or `portENTER_CRITICAL()`. | Acceptable for this project |
+| Serial ownership | LoggerTask is the sole owner of Serial writes. Supervisor and fault controller route all messages through Queue B. If Queue B is full, the supervisor drops the message silently (non-blocking send); fault_controller waits up to 100 ms (it is lowest priority so Logger can drain the queue during the wait). | In production: add a dedicated fault UART or use an emergency ring buffer |
+| `volatile` scope | `volatile` is sufficient because all tasks run on Core 1 (single-core scheduling). It would **not** be sufficient if tasks were split across cores or if ISRs accessed these variables. See the `config.h` comments for the full reasoning. | Move to `portENTER_CRITICAL()` or atomic operations if multi-core sharing is needed |
+| Counter increment race | The `g_queue_a_overflow_count++` is a read-modify-write. On a single core with preemption, a preemption between the read and write steps could miscount by 1. The count is monotonic and used only for reporting, so this edge case is acceptable here. | Wrap increment in `portENTER_CRITICAL()` for strict accuracy |
 | No task restart on failure | The supervisor detects but cannot restart a failed task (no handle stored). | Store task handles and call `vTaskDelete()` + `xTaskCreate()` |
 | Wokwi-only testing | Cannot verify real hardware timing or actual DHT22 failure modes. | Test on real hardware with an actual DHT22 |
 | Overflow counters never reset | Counts accumulate since boot. | Add a `RESET_COUNTERS` command |
@@ -528,3 +553,36 @@ All measurements are based on actual program state variables, not hardcoded valu
 ## Licence
 
 This project is released for educational purposes. Free to use, modify, and share.
+
+---
+
+## Appendix: Corrections Applied (v1 → v2)
+
+The following targeted corrections were made after the initial release. No new features were added and the project architecture was preserved.
+
+### Fix 1 — SENSOR_STOP: behaviour made explicit (`sensor_task.cpp`)
+**Problem:** `SENSOR_STOP` froze the heartbeat but `xQueueSend()` still ran, so sensor data continued to flow into Queue A. A "stopped" task should produce neither health reports nor output.
+
+**Fix:** Added `continue` after `vTaskDelayUntil()` inside the `SENSOR_STOP` guard block. When the flag is set, the task sleeps for one full period and immediately starts the next loop iteration, skipping the read, the queue send, and the QUEUE_STRESS burst. The heartbeat is never reached because the `continue` bypasses it.
+
+### Fix 2 — SENSOR_SLOW: predictable timing (`sensor_task.cpp`, `config.h`)
+**Problem:** `vTaskDelay(3000)` consumed 3 s. The subsequent `vTaskDelayUntil(lastWakeTime, 1000)` found its deadline already 2 s in the past and returned immediately, causing the task to spin several times before re-synchronising. The actual period was not the documented ~4 s.
+
+**Fix:** After `vTaskDelay(3000)`, the code now resets `lastWakeTime = xTaskGetTickCount()`. This re-anchors the timing grid so the subsequent `vTaskDelayUntil(1000)` correctly waits a full extra second. Total effective period = 3000 + 1000 = **4000 ms**, which is predictable, documented, and matches the supervisor timeout threshold.
+
+### Fix 3 — Serial ownership: direct writes removed (`supervisor_task.cpp`, `fault_controller.cpp`)
+**Problem:** Both `supervisorReport()` and `cmdReport()` called `Serial.print()` directly when Queue B was full. This violated the single-Serial-owner principle (LoggerTask) and could produce interleaved/garbled output on UART.
+
+**Fix:**
+- `supervisorReport()` now uses `xQueueSend(timeout=0)`. If Queue B is full, the message is silently dropped. The supervisor's status summary repeats every 2 s and fault transitions are reported once per state change, so a single dropped message is not critical. The function no longer touches `Serial`.
+- `cmdReport()` retains a 100 ms `xQueueSend` timeout (the fault command task is lowest priority, so the Logger at priority 2 will preempt it and drain Queue B during the wait). The `Serial.print()` fallback is removed. If the queue is still full after 100 ms, the message is dropped silently.
+
+### Fix 4 — Synchronisation: accurate documentation (`config.h`)
+**Problem:** Comments claimed `volatile` was sufficient because "32-bit reads/writes are atomic by hardware". This confused hardware atomicity (a property of the Xtensa LX6 bus) with the separate requirement to prevent compiler register-caching.
+
+**Fix:** `volatile` is correct here, but the justification is now accurate: all five tasks are pinned to Core 1, so only one task runs at a time (single-core preemptive scheduling). `volatile` prevents the compiler from caching values in registers; no torn reads can occur because there is no parallel execution. The comments now also explicitly state the conditions under which `volatile` would **not** be sufficient (multi-core, ISR access), and note the theoretical counter-increment race for the overflow counters.
+
+### Fix 5 — Supervisor scheduling: documented and tuned (`supervisor_task.cpp`)
+**Problem:** The supervisor used `xQueueSend(timeout=50ms)` per message. With up to 5 messages per cycle, it could block for up to 250 ms per cycle. While blocking on a queue yields the CPU (so lower-priority tasks do run), the timeout was unnecessary given the new drop-silently policy.
+
+**Fix:** Timeout changed to `0` (non-blocking) in `supervisorReport()`. The supervisor's active work per cycle now completes in well under 1 ms. It then sleeps for the full `SUPERVISOR_PERIOD_MS` (2 s) in the blocked state, using zero CPU. The header comment explains the scheduling model and confirms there is no starvation risk.
