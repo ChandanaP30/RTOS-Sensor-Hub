@@ -27,6 +27,7 @@
 //   SENSOR_NORMAL — clear g_fault_sensor_slow
 //   INVALID_DATA  — toggle g_fault_invalid_data (force NaN readings)
 //   QUEUE_STRESS  — toggle g_fault_queue_stress (burst-fill Queue A)
+//   QUEUE_B_STRESS— toggle g_fault_queue_b_stress (burst-fill Queue B)
 //   RESET_FAULTS  — clear all fault flags at once
 //
 // FreeRTOS concepts:
@@ -74,6 +75,7 @@ static void printHelp() {
     cmdReport("  SENSOR_NORMAL - Remove sensor delay");
     cmdReport("  INVALID_DATA  - Force invalid (NaN) sensor readings");
     cmdReport("  QUEUE_STRESS  - Burst-fill Queue A to trigger overflow");
+    cmdReport("  QUEUE_B_STRESS- Burst-fill Queue B to trigger overflow");
     cmdReport("  RESET_FAULTS  - Clear all fault injection flags");
     cmdReport("----------------------------------------");
 }
@@ -84,52 +86,79 @@ static void printHelp() {
 static void printStatus() {
     char buf[LOG_MSG_LEN];
 
+    // Snapshot all shared state in one critical section.
+    // We copy everything into locals, then format/print outside the lock.
+    bool snap_stop, snap_slow, snap_invalid, snap_stress, snap_b_stress;
+    uint32_t snap_qa_ovf, snap_qb_ovf, snap_inv_cnt;
+    uint32_t snap_sensor_beats, snap_proc_beats, snap_logger_beats;
+    uint32_t snap_sensor_last;
+
+    portENTER_CRITICAL(&g_shared_mux);
+    snap_stop         = g_fault_sensor_stop;
+    snap_slow         = g_fault_sensor_slow;
+    snap_invalid      = g_fault_invalid_data;
+    snap_stress       = g_fault_queue_stress;
+    snap_b_stress     = g_fault_queue_b_stress;
+    snap_qa_ovf       = g_queue_a_overflow_count;
+    snap_qb_ovf       = g_queue_b_overflow_count;
+    snap_inv_cnt      = g_invalid_reading_count;
+    snap_sensor_beats = g_hb_sensor.beat_count;
+    snap_proc_beats   = g_hb_processing.beat_count;
+    snap_logger_beats = g_hb_logger.beat_count;
+    snap_sensor_last  = g_hb_sensor.last_beat_ms;
+    portEXIT_CRITICAL(&g_shared_mux);
+
+    // All formatting below uses only locals — no lock held
     cmdReport("=== SYSTEM STATUS ===");
 
     snprintf(buf, LOG_MSG_LEN,
-        "  SENSOR_STOP   : %s", g_fault_sensor_stop   ? "ON" : "off");
+        "  SENSOR_STOP   : %s", snap_stop   ? "ON" : "off");
     cmdReport(buf);
 
     snprintf(buf, LOG_MSG_LEN,
-        "  SENSOR_SLOW   : %s", g_fault_sensor_slow   ? "ON" : "off");
+        "  SENSOR_SLOW   : %s", snap_slow   ? "ON" : "off");
     cmdReport(buf);
 
     snprintf(buf, LOG_MSG_LEN,
-        "  INVALID_DATA  : %s", g_fault_invalid_data  ? "ON" : "off");
+        "  INVALID_DATA  : %s", snap_invalid  ? "ON" : "off");
     cmdReport(buf);
 
     snprintf(buf, LOG_MSG_LEN,
-        "  QUEUE_STRESS  : %s", g_fault_queue_stress  ? "ON" : "off");
+        "  QUEUE_STRESS  : %s", snap_stress  ? "ON" : "off");
     cmdReport(buf);
 
     snprintf(buf, LOG_MSG_LEN,
-        "  Queue A overflows : %lu", (unsigned long)g_queue_a_overflow_count);
+        "  QUEUE_B_STRESS: %s", snap_b_stress ? "ON" : "off");
     cmdReport(buf);
 
     snprintf(buf, LOG_MSG_LEN,
-        "  Queue B overflows : %lu", (unsigned long)g_queue_b_overflow_count);
+        "  Queue A overflows : %lu", (unsigned long)snap_qa_ovf);
     cmdReport(buf);
 
     snprintf(buf, LOG_MSG_LEN,
-        "  Invalid readings  : %lu", (unsigned long)g_invalid_reading_count);
+        "  Queue B overflows : %lu", (unsigned long)snap_qb_ovf);
     cmdReport(buf);
 
     snprintf(buf, LOG_MSG_LEN,
-        "  Sensor beats      : %lu", (unsigned long)g_hb_sensor.beat_count);
+        "  Invalid readings  : %lu", (unsigned long)snap_inv_cnt);
     cmdReport(buf);
 
     snprintf(buf, LOG_MSG_LEN,
-        "  Processing beats  : %lu", (unsigned long)g_hb_processing.beat_count);
+        "  Sensor beats      : %lu", (unsigned long)snap_sensor_beats);
     cmdReport(buf);
 
     snprintf(buf, LOG_MSG_LEN,
-        "  Logger beats      : %lu", (unsigned long)g_hb_logger.beat_count);
+        "  Processing beats  : %lu", (unsigned long)snap_proc_beats);
+    cmdReport(buf);
+
+    snprintf(buf, LOG_MSG_LEN,
+        "  Logger beats      : %lu", (unsigned long)snap_logger_beats);
     cmdReport(buf);
 
     uint32_t now = millis();
     snprintf(buf, LOG_MSG_LEN,
         "  Sensor last beat  : %lums ago",
-        (unsigned long)(now - g_hb_sensor.last_beat_ms));
+        (unsigned long)(now - snap_sensor_last));
     cmdReport(buf);
 
     cmdReport("=====================");
@@ -148,50 +177,84 @@ static void processCommand(const String& cmd) {
         printStatus();
 
     } else if (cmd == "SENSOR_STOP") {
+        portENTER_CRITICAL(&g_shared_mux);
         g_fault_sensor_stop = true;
+        portEXIT_CRITICAL(&g_shared_mux);
         cmdReport("[CMD] SENSOR_STOP activated.");
         cmdReport("      Sensor heartbeat AND queue sends are now suppressed.");
         cmdReport("      Task is alive but doing no useful work.");
         cmdReport("      Supervisor fault expected in ~3 s.");
 
     } else if (cmd == "SENSOR_RESUME") {
+        portENTER_CRITICAL(&g_shared_mux);
         g_fault_sensor_stop = false;
+        portEXIT_CRITICAL(&g_shared_mux);
         cmdReport("[CMD] SENSOR_RESUME — sensor heartbeat restored.");
 
     } else if (cmd == "SENSOR_SLOW") {
+        portENTER_CRITICAL(&g_shared_mux);
         g_fault_sensor_slow = true;
+        portEXIT_CRITICAL(&g_shared_mux);
         cmdReport("[CMD] SENSOR_SLOW activated — 3 s extra delay per sensor cycle.");
         cmdReport("      Effective period: ~4 s (3 s delay + 1 s normal period).");
         cmdReport("      Supervisor timeout is 3 s — fault will be reported.");
 
     } else if (cmd == "SENSOR_NORMAL") {
+        portENTER_CRITICAL(&g_shared_mux);
         g_fault_sensor_slow = false;
+        portEXIT_CRITICAL(&g_shared_mux);
         cmdReport("[CMD] SENSOR_NORMAL — sensor delay removed.");
 
     } else if (cmd == "INVALID_DATA") {
+        bool newVal;
+        portENTER_CRITICAL(&g_shared_mux);
         g_fault_invalid_data = !g_fault_invalid_data;  // Toggle
+        newVal = g_fault_invalid_data;
+        portEXIT_CRITICAL(&g_shared_mux);
         snprintf(buf, LOG_MSG_LEN,
             "[CMD] INVALID_DATA %s — sensor will now produce %s readings.",
-            g_fault_invalid_data ? "ON" : "OFF",
-            g_fault_invalid_data ? "NaN (invalid)" : "real data");
+            newVal ? "ON" : "OFF",
+            newVal ? "NaN (invalid)" : "real data");
         cmdReport(buf);
 
     } else if (cmd == "QUEUE_STRESS") {
+        bool newVal;
+        portENTER_CRITICAL(&g_shared_mux);
         g_fault_queue_stress = !g_fault_queue_stress;  // Toggle
+        newVal = g_fault_queue_stress;
+        portEXIT_CRITICAL(&g_shared_mux);
         snprintf(buf, LOG_MSG_LEN,
             "[CMD] QUEUE_STRESS %s — burst of %d extra items per sensor cycle.",
-            g_fault_queue_stress ? "ON" : "OFF",
+            newVal ? "ON" : "OFF",
             (int)QUEUE_STRESS_BURST);
         cmdReport(buf);
-        if (g_fault_queue_stress) {
+        if (newVal) {
             cmdReport("      Queue A overflows expected immediately.");
         }
 
+    } else if (cmd == "QUEUE_B_STRESS") {
+        bool newVal;
+        portENTER_CRITICAL(&g_shared_mux);
+        g_fault_queue_b_stress = !g_fault_queue_b_stress;  // Toggle
+        newVal = g_fault_queue_b_stress;
+        portEXIT_CRITICAL(&g_shared_mux);
+        snprintf(buf, LOG_MSG_LEN,
+            "[CMD] QUEUE_B_STRESS %s — burst of %d extra LogMessages per reading in ProcessingTask.",
+            newVal ? "ON" : "OFF",
+            (int)QUEUE_B_STRESS_BURST);
+        cmdReport(buf);
+        if (newVal) {
+            cmdReport("      Queue B overflows expected immediately.");
+        }
+
     } else if (cmd == "RESET_FAULTS") {
-        g_fault_sensor_stop  = false;
-        g_fault_sensor_slow  = false;
-        g_fault_invalid_data = false;
-        g_fault_queue_stress = false;
+        portENTER_CRITICAL(&g_shared_mux);
+        g_fault_sensor_stop    = false;
+        g_fault_sensor_slow    = false;
+        g_fault_invalid_data   = false;
+        g_fault_queue_stress   = false;
+        g_fault_queue_b_stress = false;
+        portEXIT_CRITICAL(&g_shared_mux);
         cmdReport("[CMD] RESET_FAULTS — all fault injection flags cleared.");
         cmdReport("      System should return to normal within one sensor cycle.");
 

@@ -73,6 +73,10 @@ static void supervisorReport(const char* text) {
 // ---------------------------------------------------------------------------
 // Helper: check one task's heartbeat and report any state change.
 //
+// Reads last_beat_ms and beat_count under a critical section, then works
+// entirely with local copies.  The critical section is exited before any
+// queue send or snprintf call — no blocking inside the lock.
+//
 // Parameters:
 //   hb         — pointer to the task's HeartbeatRecord
 //   timeout_ms — how many ms of silence before declaring unhealthy
@@ -84,8 +88,20 @@ static bool checkHeartbeat(
         uint32_t timeout_ms,
         bool& was_healthy) {
 
+    // Snapshot the heartbeat record under a critical section
+    uint32_t snap_beat_ms;
+    uint32_t snap_beat_count;
+    const char* snap_name;
+
+    portENTER_CRITICAL(&g_shared_mux);
+    snap_beat_ms    = hb->last_beat_ms;
+    snap_beat_count = hb->beat_count;
+    snap_name       = hb->task_name;    // pointer to string literal — safe
+    portEXIT_CRITICAL(&g_shared_mux);
+
+    // All work below uses only local variables — no lock held
     uint32_t now = millis();
-    uint32_t age = now - hb->last_beat_ms;   // ms since last heartbeat
+    uint32_t age = now - snap_beat_ms;
     bool healthy = (age <= timeout_ms);
 
     char buf[LOG_MSG_LEN];
@@ -94,7 +110,7 @@ static bool checkHeartbeat(
         // Transition: healthy → unhealthy
         snprintf(buf, LOG_MSG_LEN,
             "[FAULT] *** %s UNRESPONSIVE! Last beat %lums ago (timeout=%lums) ***",
-            hb->task_name,
+            snap_name,
             (unsigned long)age,
             (unsigned long)timeout_ms);
         supervisorReport(buf);
@@ -103,8 +119,8 @@ static bool checkHeartbeat(
         // Transition: unhealthy → healthy (recovery)
         snprintf(buf, LOG_MSG_LEN,
             "[RECOVERY] %s is healthy again. Beat count=%lu",
-            hb->task_name,
-            (unsigned long)hb->beat_count);
+            snap_name,
+            (unsigned long)snap_beat_count);
         supervisorReport(buf);
         was_healthy = true;
     }
@@ -150,10 +166,16 @@ void supervisorTask(void* pvParameters) {
         checkHeartbeat(&g_hb_logger,     LOGGER_HEARTBEAT_TIMEOUT_MS,     logger_healthy);
 
         // ------------------------------------------------------------------
-        // Check for new queue overflow events
+        // Check for new queue overflow events and invalid reading count.
+        // Snapshot all three counters in one critical section so the values
+        // are consistent with each other.
         // ------------------------------------------------------------------
-        uint32_t qa = g_queue_a_overflow_count;
-        uint32_t qb = g_queue_b_overflow_count;
+        uint32_t qa, qb, inv;
+        portENTER_CRITICAL(&g_shared_mux);
+        qa  = g_queue_a_overflow_count;
+        qb  = g_queue_b_overflow_count;
+        inv = g_invalid_reading_count;
+        portEXIT_CRITICAL(&g_shared_mux);
 
         if (qa != prev_qa_overflow) {
             snprintf(buf, LOG_MSG_LEN,
@@ -171,9 +193,8 @@ void supervisorTask(void* pvParameters) {
         }
 
         // ------------------------------------------------------------------
-        // Check for new invalid readings
+        // Check for new invalid readings (inv was already snapshot above)
         // ------------------------------------------------------------------
-        uint32_t inv = g_invalid_reading_count;
         if (inv != prev_invalid) {
             snprintf(buf, LOG_MSG_LEN,
                 "[WARN] Invalid sensor readings detected. Total: %lu",

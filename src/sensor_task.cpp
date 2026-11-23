@@ -77,11 +77,18 @@ void sensorTask(void* pvParameters) {
         // Effective total period in slow mode:
         //   SLOW_SENSOR_EXTRA_DELAY_MS + SENSOR_PERIOD_MS = ~4000 ms
         // ------------------------------------------------------------------
-        if (g_fault_sensor_slow) {
-            vTaskDelay(MS_TO_TICKS(SLOW_SENSOR_EXTRA_DELAY_MS));
-            // Re-anchor the periodic grid so vTaskDelayUntil is not stale
-            lastWakeTime = xTaskGetTickCount();
-        }
+       bool sensorSlow;
+
+portENTER_CRITICAL(&g_shared_mux);
+sensorSlow = g_fault_sensor_slow;
+portEXIT_CRITICAL(&g_shared_mux);
+
+if (sensorSlow) {
+    vTaskDelay(MS_TO_TICKS(SLOW_SENSOR_EXTRA_DELAY_MS));
+
+    // Re-anchor the periodic grid
+    lastWakeTime = xTaskGetTickCount();
+}
 
         // ------------------------------------------------------------------
         // Fault injection: SENSOR_STOP
@@ -99,17 +106,31 @@ void sensorTask(void* pvParameters) {
         // These two effects are intentional and consistent: a "stopped" task
         // neither reports its health nor produces output.
         // ------------------------------------------------------------------
-        if (g_fault_sensor_stop) {
-            // Skip heartbeat and data send; just wait for the next period
-            vTaskDelayUntil(&lastWakeTime, MS_TO_TICKS(SENSOR_PERIOD_MS));
-            continue;
-        }
+        bool sensorStop;
+
+portENTER_CRITICAL(&g_shared_mux);
+sensorStop = g_fault_sensor_stop;
+portEXIT_CRITICAL(&g_shared_mux);
+
+if (sensorStop) {
+    // Skip heartbeat and data send; just wait for the next period
+    vTaskDelayUntil(&lastWakeTime, MS_TO_TICKS(SENSOR_PERIOD_MS));
+    continue;
+}
 
         // ------------------------------------------------------------------
-        // Normal operation: update heartbeat
+        // Normal operation: update heartbeat.
+        // Both fields are written together inside one critical section so the
+        // supervisor never sees a beat_count that belongs to a different
+        // last_beat_ms value.
         // ------------------------------------------------------------------
-        g_hb_sensor.last_beat_ms = millis();
-        g_hb_sensor.beat_count++;
+        {
+            uint32_t now_ms = millis();
+            portENTER_CRITICAL(&g_shared_mux);
+            g_hb_sensor.last_beat_ms = now_ms;
+            g_hb_sensor.beat_count++;
+            portEXIT_CRITICAL(&g_shared_mux);
+        }
 
         // ------------------------------------------------------------------
         // Read the sensor
@@ -117,7 +138,14 @@ void sensorTask(void* pvParameters) {
         SensorData reading;
         reading.timestamp_ms = millis();
 
-        if (g_fault_invalid_data) {
+        // Read g_fault_invalid_data under a critical section into a local
+        // variable so we do not hold the lock during the DHT read below.
+        bool invalidData;
+        portENTER_CRITICAL(&g_shared_mux);
+        invalidData = g_fault_invalid_data;
+        portEXIT_CRITICAL(&g_shared_mux);
+
+        if (invalidData) {
             // Fault injection: force NaN values so the Processing Task
             // has something invalid to detect and report.
             reading.temperature = NAN;
@@ -140,22 +168,33 @@ void sensorTask(void* pvParameters) {
         // Timeout = 0: if the queue is full, we do NOT block — we just
         // count the failure and move on.  Blocking here could cause a
         // priority inversion if the Processing Task is delayed.
+        // The overflow counter increment is protected so it is not torn
+        // by a preemption between its read and write steps.
         // ------------------------------------------------------------------
         BaseType_t sent = xQueueSend(g_queue_a, &reading, 0);
         if (sent != pdTRUE) {
-            // Queue was full — count the overflow
+            portENTER_CRITICAL(&g_shared_mux);
             g_queue_a_overflow_count++;
+            portEXIT_CRITICAL(&g_shared_mux);
         }
 
         // ------------------------------------------------------------------
         // Fault injection: QUEUE_STRESS
         // Send the same reading repeatedly to rapidly fill the queue,
         // which demonstrates overflow handling.
+        // Read the flag under a critical section; loop outside the section.
         // ------------------------------------------------------------------
-        if (g_fault_queue_stress) {
+        bool queueStress;
+        portENTER_CRITICAL(&g_shared_mux);
+        queueStress = g_fault_queue_stress;
+        portEXIT_CRITICAL(&g_shared_mux);
+
+        if (queueStress) {
             for (uint32_t i = 0; i < QUEUE_STRESS_BURST; i++) {
                 if (xQueueSend(g_queue_a, &reading, 0) != pdTRUE) {
+                    portENTER_CRITICAL(&g_shared_mux);
                     g_queue_a_overflow_count++;
+                    portEXIT_CRITICAL(&g_shared_mux);
                 }
             }
         }

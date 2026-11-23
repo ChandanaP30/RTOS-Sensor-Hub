@@ -13,7 +13,8 @@
 // =============================================================================
 
 #include <Arduino.h>   // TickType_t, portTICK_PERIOD_MS
-
+// Shared lock for protecting data accessed by multiple FreeRTOS tasks
+extern portMUX_TYPE g_shared_mux;
 // ---------------------------------------------------------------------------
 // Hardware pin definitions
 // ---------------------------------------------------------------------------
@@ -105,6 +106,7 @@ constexpr uint32_t LOGGER_HEARTBEAT_TIMEOUT_MS     = 1000;  // 5× normal period
 // ---------------------------------------------------------------------------
 constexpr uint32_t SLOW_SENSOR_EXTRA_DELAY_MS = 3000; // Extra delay in SENSOR_SLOW mode
 constexpr uint32_t QUEUE_STRESS_BURST         = 20;   // Items pushed rapidly during QUEUE_STRESS
+constexpr uint32_t QUEUE_B_STRESS_BURST       = 20;   // Items pushed rapidly during QUEUE_B_STRESS
 
 // ---------------------------------------------------------------------------
 // Shared data structure: one sensor reading passed between tasks
@@ -132,29 +134,19 @@ struct LogMessage {
 // ---------------------------------------------------------------------------
 // Heartbeat record — one per monitored task
 //
-// Synchronisation model:
-//   All five tasks are pinned to Core 1 (see xTaskCreatePinnedToCore in
-//   main.cpp).  On a single core, the FreeRTOS preemptive scheduler ensures
-//   only one task executes at a time — there is no true parallel execution.
-//   Therefore:
-//     • 32-bit reads and writes cannot be "torn" (interrupted mid-operation).
-//     • No CPU cache-coherency issue exists between tasks on the same core.
+// Synchronisation:
+//   All reads and writes to last_beat_ms and beat_count are protected by
+//   portENTER_CRITICAL(&g_shared_mux) / portEXIT_CRITICAL(&g_shared_mux).
+//   Each worker task writes both fields together inside one critical section.
+//   The supervisor snapshots both fields in one critical section before
+//   comparing them, ensuring it never sees a half-updated pair.
 //
-//   The 'volatile' qualifier is still necessary here.  Without it the compiler
-//   is free to keep last_beat_ms in a CPU register across loop iterations and
-//   never re-read it from SRAM.  'volatile' forces every access to go to
-//   actual memory, ensuring that a write in one task is visible to any task
-//   that is later scheduled on the same core.
-//
-//   'volatile' is NOT a general substitute for a mutex.  It is sufficient
-//   here because:
-//     a) All tasks run on Core 1 (single-core scheduling).
-//     b) No ISR accesses these records.
-//     c) The only operation performed is a single 32-bit store (write) or
-//        load (read) — no compound read-modify-write that would need atomicity.
-//
-//   If any task were moved to Core 0, or if an ISR updated these fields,
-//   a portENTER_CRITICAL() / portEXIT_CRITICAL() section would be required.
+//   The 'volatile' qualifier is retained as a secondary safeguard: it prevents
+//   the compiler from optimising away memory accesses inside the critical
+//   section itself.  On ESP32, portENTER_CRITICAL already acts as a compiler
+//   barrier, so volatile is technically redundant when the critical section
+//   is used correctly — but keeping it makes the intent explicit and costs
+//   nothing.
 // ---------------------------------------------------------------------------
 struct HeartbeatRecord {
     volatile uint32_t last_beat_ms;   // millis() of the most recent heartbeat
@@ -166,16 +158,17 @@ struct HeartbeatRecord {
 // Global fault injection flags
 // Declared extern here; defined once in main.cpp.
 //
-// Synchronisation: same single-core model as HeartbeatRecord above.
-// FaultCmdTask writes these flags; SensorTask and ProcessingTask read them.
-// All tasks are on Core 1 — no parallel execution, no torn reads possible.
-// 'volatile' prevents the compiler from caching the value in a register and
-// missing a write from another task.  No mutex is required.
+// Synchronisation:
+//   All reads and writes are guarded by portENTER_CRITICAL(&g_shared_mux)
+//   and portEXIT_CRITICAL(&g_shared_mux). Tasks read flags into local
+//   variables inside the critical section and execute any subsequent logic,
+//   delays, or queue operations outside the critical section.
 // ---------------------------------------------------------------------------
 extern volatile bool g_fault_sensor_stop;    // stop heartbeat AND queue send
 extern volatile bool g_fault_sensor_slow;    // add extra delay to sensor
 extern volatile bool g_fault_invalid_data;   // force NaN readings
 extern volatile bool g_fault_queue_stress;   // burst-fill the queue
+extern volatile bool g_fault_queue_b_stress; // burst-fill Queue B from ProcessingTask
 
 // ---------------------------------------------------------------------------
 // Global heartbeat records (defined in main.cpp, used by all tasks)
@@ -194,14 +187,10 @@ extern QueueHandle_t g_queue_b;   // LogMessage:   Processing → Logger
 // ---------------------------------------------------------------------------
 // Global counters
 //
-// Synchronisation: same single-core model — volatile prevents register
-// caching; the increment (++) is a compound read-modify-write.  On a single
-// core with preemptive scheduling, this is safe as long as we accept the
-// (theoretical) risk that a preemption occurs between the read and write.
-// In practice this would only miscalculate a count by 1 in an edge case;
-// the counter never resets, so the value is always monotonically correct
-// for fault reporting purposes.  A portENTER_CRITICAL() section would
-// eliminate even this theoretical risk if strict accuracy were required.
+// Synchronisation:
+//   All reads and increments (read-modify-write) are protected by
+//   portENTER_CRITICAL(&g_shared_mux) / portEXIT_CRITICAL(&g_shared_mux),
+//   guaranteeing race-free counter updates across all tasks.
 // ---------------------------------------------------------------------------
 extern volatile uint32_t g_queue_a_overflow_count;
 extern volatile uint32_t g_queue_b_overflow_count;

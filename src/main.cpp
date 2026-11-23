@@ -13,6 +13,8 @@
 
 #include <Arduino.h>
 #include "config.h"
+// Shared lock used by all tasks when accessing shared variables
+portMUX_TYPE g_shared_mux = portMUX_INITIALIZER_UNLOCKED;
 
 // ---------------------------------------------------------------------------
 // Forward declarations for the five task functions
@@ -38,10 +40,11 @@ HeartbeatRecord g_hb_processing = { 0, 0, "ProcessingTask" };
 HeartbeatRecord g_hb_logger     = { 0, 0, "LoggerTask"     };
 
 // Fault injection flags (all false = normal operation)
-volatile bool g_fault_sensor_stop   = false;
-volatile bool g_fault_sensor_slow   = false;
-volatile bool g_fault_invalid_data  = false;
-volatile bool g_fault_queue_stress  = false;
+volatile bool g_fault_sensor_stop    = false;
+volatile bool g_fault_sensor_slow    = false;
+volatile bool g_fault_invalid_data   = false;
+volatile bool g_fault_queue_stress   = false;
+volatile bool g_fault_queue_b_stress = false;
 
 // Overflow / error counters
 volatile uint32_t g_queue_a_overflow_count = 0;

@@ -346,7 +346,8 @@ Open the Serial Monitor at **115200 baud**. Type any command and press Enter.
 | `SENSOR_SLOW` | Adds 3 s delay → effective period ~4 s | Fault detected (3 s timeout); recovery when cycle completes |
 | `SENSOR_NORMAL` | Removes the delay | Normal 1 s period resumes |
 | `INVALID_DATA` | Toggles NaN sensor readings | Processing Task reports DATA-ERR |
-| `QUEUE_STRESS` | Toggles burst-filling of Queue A | Queue overflows reported immediately |
+| `QUEUE_STRESS` | Toggles burst-filling of Queue A | Queue A overflows reported immediately |
+| `QUEUE_B_STRESS` | Toggles burst-filling of Queue B | Queue B overflows reported immediately |
 | `RESET_FAULTS` | Clears all fault flags | System returns to normal operation |
 
 ---
@@ -445,7 +446,7 @@ Without the `lastWakeTime` reset, `vTaskDelayUntil` would find its deadline alre
 
 **Type `INVALID_DATA` again to toggle off.**
 
-### Test 5: Queue Overflow
+### Test 5: Queue Overflow (Queue A)
 
 **Procedure:** Type `QUEUE_STRESS`.
 
@@ -458,6 +459,27 @@ Without the `lastWakeTime` reset, `vTaskDelayUntil` would find its deadline alre
 ```
 
 **Type `QUEUE_STRESS` again to toggle off.**
+
+### Test 5B: Queue B Overflow (ProcessingTask → LoggerTask)
+
+**Procedure:** Type `QUEUE_B_STRESS`.
+
+**What QUEUE_B_STRESS does:**
+ProcessingTask normally validates incoming readings from Queue A and forwards a single formatted `LogMessage` to Queue B (depth = 10). When `QUEUE_B_STRESS` is active, ProcessingTask generates an additional burst of 20 `[QUEUE-B-TEST]` messages using non-blocking `xQueueSend(g_queue_b, &msg, 0)` for every sensor reading received. Because LoggerTask runs periodically (200 ms) and UART output is serialized, the burst immediately saturates Queue B. Failed sends increment `g_queue_b_overflow_count` inside a critical section.
+
+**Expected output (within 1 second):**
+```
+[CMD] QUEUE_B_STRESS ON — burst of 20 extra LogMessages per reading in ProcessingTask.
+      Queue B overflows expected immediately.
+[    5500ms] [QUEUE-B-TEST] Stress message #1
+[    5501ms] [QUEUE-B-TEST] Stress message #2
+...
+[    6000ms] [FAULT] Queue B overflow! Total lost log messages: 11
+[    6000ms] [SUPER] t=6000ms | Sensor:OK Processing:OK Logger:OK | QA_OVF:0 QB_OVF:11 INV:0
+```
+Note that `QA_OVF` remains 0, verifying that only Queue B experiences pressure.
+
+**Type `QUEUE_B_STRESS` again (or send `RESET_FAULTS`) to toggle off.**
 
 ### Test 6: Recovery
 

@@ -31,10 +31,17 @@ void loggerTask(void* pvParameters) {
     while (true) {
 
         // ------------------------------------------------------------------
-        // Update heartbeat BEFORE draining the queue
+        // Update heartbeat BEFORE draining the queue.
+        // Both fields written together under one critical section so the
+        // supervisor always reads a consistent pair.
         // ------------------------------------------------------------------
-        g_hb_logger.last_beat_ms = millis();
-        g_hb_logger.beat_count++;
+        {
+            uint32_t now_ms = millis();
+            portENTER_CRITICAL(&g_shared_mux);
+            g_hb_logger.last_beat_ms = now_ms;
+            g_hb_logger.beat_count++;
+            portEXIT_CRITICAL(&g_shared_mux);
+        }
 
         // ------------------------------------------------------------------
         // Drain all currently-available messages from Queue B.
