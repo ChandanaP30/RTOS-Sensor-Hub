@@ -1,548 +1,417 @@
-# 🚔 KSP Crime Intelligence Platform
+# RTOS Sensor Hub
 
-**Karnataka State Police FIR Platform — KSP Datathon 2026**
+**Runtime task health monitoring and fault injection for a FreeRTOS-based ESP32 sensor hub, developed and tested in Wokwi simulation.**
 
-A modern, AI-powered crime intelligence dashboard built on **Zoho Catalyst** (serverless Node.js backend) with a **React + Vite** frontend, providing real-time crime data visualization, CCTV recommendations, AI patrol planning, a document-grounded AI knowledge base, an AI chatbot, and criminal network mapping for law enforcement agencies.
+![Platform](https://img.shields.io/badge/MCU-ESP32-E7352C?logo=espressif&logoColor=white)
+![RTOS](https://img.shields.io/badge/RTOS-FreeRTOS-green)
+![Language](https://img.shields.io/badge/language-C%2B%2B-00599C?logo=cplusplus&logoColor=white)
+![Build](https://img.shields.io/badge/build-PlatformIO-F5822A?logo=platformio&logoColor=white)
+![Simulation](https://img.shields.io/badge/tested%20in-Wokwi%20simulation-blueviolet)
 
-**Status**: ✅ Production Ready
-**Version**: 1.0.0
-**Last Updated**: July 26, 2026
+> [!NOTE]
+> **Scope:** this project was developed and tested in the [Wokwi](https://wokwi.com) simulator. It has **not** been validated on a physical ESP32 or a real DHT22, and no hardware measurements are reported here.
 
 ---
 
-## 📋 Table of Contents
+## Table of Contents
 
-1. [Overview](#overview)
-2. [Key Features](#key-features)
-3. [Technology Stack](#technology-stack)
-4. [Project Structure](#project-structure)
-5. [Prerequisites](#prerequisites)
-6. [Setup & Installation](#setup--installation)
-7. [Development](#development)
-8. [Deployment](#deployment)
-9. [API Documentation](#api-documentation)
-10. [Features Guide](#features-guide)
-11. [Troubleshooting](#troubleshooting)
-12. [Contributing](#contributing)
+- [Overview](#overview)
+- [Key Features](#key-features)
+- [System Architecture](#system-architecture)
+- [Simulation Screenshots](#simulation-screenshots)
+- [Quick Start](#quick-start)
+- [Serial Command Reference](#serial-command-reference)
+- [Fault-Injection Walkthrough](#fault-injection-walkthrough)
+- [Log Analyser](#log-analyser)
+- [Configuration](#configuration)
+- [Hardware (Simulated)](#hardware-simulated)
+- [Technology Stack](#technology-stack)
+- [Project Structure](#project-structure)
+- [Troubleshooting](#troubleshooting)
+- [Limitations](#limitations)
+- [Possible Future Improvements](#possible-future-improvements)
 
 ---
 
 ## Overview
 
-The **KSP Crime Intelligence Platform** is a comprehensive law enforcement intelligence system designed to:
+This project runs five FreeRTOS tasks on an ESP32. A sensor task reads a DHT22 (temperature and humidity), a processing task validates each reading, and a logger task prints everything to the Serial Monitor. A supervisor task watches the other tasks using **heartbeats** and reports when one stops responding.
 
-- **Visualize Crime Data** on an interactive Karnataka map with district overlays
-- **Detect Crime Hotspots** using intelligent clustering and priority-based CCTV recommendations
-- **Recommend AI-Generated Patrol Plans** with officer counts, patrol timing, and confidence scores per area
-- **Analyze Patterns** via an AI-powered chatbot with natural language understanding and tool-calling
-- **Answer Questions from Uploaded Documents** (SOPs, circulars, IPC/BNS references) via a grounded AI knowledge base with citations
-- **Map Criminal Networks** through relationship visualization and graph analysis
-- **Track Case Status** with real-time KPI dashboards (total cases, under investigation, chargesheeted, closed)
-- **Support Multiple Languages** with native Kannada support alongside English, including voice input and output
-- **Authenticate Officers** with a secure, role-based login screen
-- **Export Reports** in PDF format for police command centers
+**Problem it addresses.** In an embedded system, a task that quietly stops doing its job can be harder to notice than one that crashes. A simple way to catch this is for every task to record a timestamp each cycle, and for a supervisor to check how old those timestamps are. This project implements that idea and adds a **Serial command interface** so you can inject faults on purpose and watch the supervisor react.
 
-Built for the **KSP Datathon 2026** in partnership with Karnataka State Police, leveraging serverless architecture for scalability and cost-effectiveness.
-
----
+**What it demonstrates:** task creation and prioritisation, queue-based communication between tasks, periodic scheduling with `vTaskDelayUntil()`, heartbeat monitoring, non-blocking queue sends with overflow counting, and protecting shared data with FreeRTOS critical sections.
 
 ## Key Features
 
-### 1. **Officer Authentication** 🔐
-- Secure login screen (`LoginPage.jsx`) gates the entire dashboard
-- Passwords hashed with PBKDF2 (100,000 iterations) and a per-user salt — never stored in plain text
-- Officer accounts stored in a Catalyst `Officers` table (`Username`, `Role`, `FullName`, `Status`)
-- Session persists across page refreshes via `localStorage`; logout available from the top navigation
+- **Five FreeRTOS tasks** with distinct priorities, all pinned to Core 1.
+- **Heartbeat monitoring** of the sensor, processing and logger tasks, each with its own timeout.
+- **Fault and recovery reporting.** The supervisor reports when a task becomes unresponsive and when it becomes healthy again. It does not restart tasks.
+- **Two-queue data pipeline** (`Sensor → Processing → Logger`) using non-blocking sends and overflow counters.
+- **Data validation** in the processing task: NaN/infinity checks plus the DHT22 datasheet ranges (-40 to 80 °C, 0 to 100 % RH).
+- **Fault injection over Serial** with ten commands: unresponsive sensor, slow sensor, invalid data, and overflow of either queue.
+- **Single log writer.** Once the tasks are running, all log output goes through `LoggerTask`, with a millisecond timestamp on every line.
+- **Critical-section protection** for shared flags, counters and heartbeat records.
+- **Python log analyser** (`log_analyser.py`) for summarising a saved Serial log.
+- **No hardware needed.** Runs entirely in Wokwi.
 
-### 2. **KPI Dashboard** 📊
-- Real-time statistics cards showing:
-  - Total Crime Cases
-  - Cases Under Investigation
-  - Chargesheeted Cases
-  - Closed Cases
-- Color-coded status indicators
+## System Architecture
 
-### 3. **Crime Intelligence Map** 🗺️
-- Interactive Leaflet map of Karnataka state
-- Marker clustering for performance
-- District boundary overlays with color highlighting
-- Crime case markers color-coded by status:
-  - 🟡 Under Investigation (#D9A441)
-  - 🔵 Chargesheeted (#4A7FB5)
-  - 🟢 Closed (#5FA88C)
-- Pulsing hotspot zone overlay around the centroid of cases in a selected district, sized to actually enclose the farthest case (not a fixed radius)
-- Zoom controls, pan, and case popup details on marker click
-- A dynamic legend that only shows the layers currently toggled on
+```mermaid
+flowchart LR
+    DHT["DHT22 sensor<br/>(GPIO 4)"]
+    SM["Serial Monitor<br/>(115200 baud)"]
 
-### 4. **AI-Powered Chatbot** 🤖
-- Natural language query processing via a Catalyst serverless function with tool-calling
-- Tools available to the model: crime stats lookup, district comparison, hotspot detection, CCTV recommendations, and risk scoring — all backed by real ZCQL queries, never fabricated
-- Can dynamically drive the dashboard: filter by district, crime type, or status; show hotspots; show CCTV layers
-- Pre-built sample questions in English and Kannada
-- Confidence score with every AI response
-- Chat history with a dedicated history drawer
-- Voice input (Web Speech API) and voice output (browser speech synthesis) in both English and Kannada
-- PDF export of the full AI conversation history (rendered via html2canvas + jsPDF so Kannada text exports correctly)
+    subgraph ESP32["ESP32 (FreeRTOS, all tasks pinned to Core 1)"]
+        SENSOR["SensorTask<br/>priority 4, 1000 ms"]
+        QA[("Queue A<br/>SensorData, depth 5")]
+        PROC["ProcessingTask<br/>priority 3, 500 ms"]
+        QB[("Queue B<br/>LogMessage, depth 10")]
+        LOG["LoggerTask<br/>priority 2, 200 ms"]
+        SUP["SupervisorTask<br/>priority 5, 2000 ms"]
+        CMD["FaultCmdTask<br/>priority 1, 50 ms poll"]
+    end
 
-### 5. **AI Knowledge Base (RAG)** 📚
-- Upload SOPs, circulars, IPC/BNS references, and departmental policies as PDF, DOCX, or TXT
-- Real per-page text extraction for PDFs (via pdf.js) and paragraph-based section splitting for DOCX/TXT
-- BM25 lexical retrieval over document chunks — no external embeddings API required
-- Answers are grounded strictly in the uploaded documents, with real citations (document name + page/section)
-- Explicitly reports when no relevant information is found rather than guessing
-- Supports both English and Kannada queries, with voice input and a language-matching answer
+    DHT --> SENSOR
+    SENSOR --> QA --> PROC --> QB --> LOG --> SM
+    SM -.->|"commands"| CMD
+    CMD -.->|"fault flags"| SENSOR
+    CMD -.->|"fault flags"| PROC
+    SENSOR -.->|"heartbeat"| SUP
+    PROC -.->|"heartbeat"| SUP
+    LOG -.->|"heartbeat"| SUP
+    SUP -->|"status and fault reports"| QB
+    CMD -->|"command responses"| QB
+```
 
-### 6. **AI Patrol Recommendation** 🚓
-- Generates a data-driven patrol plan per area: recommended officer count, suggested patrol time window, priority tier, and a plain-language explanation
-- Cross-references nearby existing CCTV coverage and recent crime counts per area
-- Confidence score per recommendation
-- Filterable by district; regenerate on demand
+Solid arrows are queue traffic or data flow. Dotted arrows are shared variables (fault flags and heartbeat records) or Serial input.
 
-### 7. **CCTV Recommendation Engine** 📹
-- Priority-based hotspot detection for CCTV installation planning
-- Risk score calculation (0–100) based on crime case density, high-severity incident count, and existing CCTV coverage gaps
-- Two-tier prioritization:
-  - **High Priority**: #A6231F
-  - **Low Priority**: #4A7FB5
-- Displays recommended camera count, expected coverage improvement %, and the reasoning behind each recommendation
-- Clustered marker view; configurable recommendation limit
+### Tasks
 
-### 8. **Criminal Network Graph** 🔗
-- Force-directed graph visualization (react-force-graph-2d) of repeat offenders and their linked cases
-- Risk-tier node coloring: High (#D94F4F), Medium (#E08A3E), Low (#5FA88C)
-- Filter by district, crime type, year, and free-text search; option to hide isolated nodes
-- Click a node to see full case history, crime-type breakdown, and an on-demand AI-generated summary
-- Resizable filter and detail panels
+Higher number means higher priority. Source files are in [`src/`](src/).
 
-### 9. **District Boundary Overlays** 🏞️
-- GeoJSON-based district boundary visualization
-- Auto-fits to the selected district
-- Gold highlight for the selected district, subtle blue outline for the rest
+| Task | Priority | Period | Heartbeat timeout | Responsibility | Source |
+|------|:--------:|:------:|:-----------------:|----------------|--------|
+| `SupervisorTask` | 5 | 2000 ms | not monitored | Checks the three heartbeats, watches overflow and invalid-reading counters, and posts fault, recovery and status messages | [`supervisor_task.cpp`](src/supervisor_task.cpp) |
+| `SensorTask` | 4 | 1000 ms | 3000 ms | Reads the DHT22, sends a `SensorData` struct to Queue A, updates its heartbeat | [`sensor_task.cpp`](src/sensor_task.cpp) |
+| `ProcessingTask` | 3 | 500 ms | 2000 ms | Waits for Queue A (up to 500 ms), validates the reading, formats a log line, sends it to Queue B | [`processing_task.cpp`](src/processing_task.cpp) |
+| `LoggerTask` | 2 | 200 ms | 1000 ms | Drains Queue B and prints each message with a timestamp | [`logger_task.cpp`](src/logger_task.cpp) |
+| `FaultCmdTask` | 1 | 50 ms poll | not monitored | Reads Serial commands and sets or clears the fault-injection flags | [`fault_controller.cpp`](src/fault_controller.cpp) |
 
-### 10. **Analytics Dashboard** 📈
-- Crime Trend chart (last 12 months)
-- Top Crime Hotspots (top 5 stations by case count)
-- Case Resolution Rate (resolved vs. pending)
-- Auto-generated narrative AI insight summarizing the current filtered view
+**Why these priorities.** The supervisor is highest so it gets scheduled promptly even when lower-priority tasks are busy; it spends most of its time blocked and does very little work per cycle. The command task is lowest because a delay of tens of milliseconds is not noticeable for typing commands, and it should not compete with the data pipeline.
 
-### 11. **Filtering & Controls** 🎛️
-- District, Status, and Crime Type filters
-- CCTV layer toggles (recommendations, active cameras) with adjustable recommendation limit
-- Real-time map and analytics updates on every filter change
+### Queues
 
-### 12. **Multi-Language Support** 🌐
-- English and native Kannada (ಕನ್ನಡ) script support throughout the UI
-- Global language toggle in the top navigation
-- AI chatbot and Knowledge Base both understand and respond in Kannada, regardless of which script the question was typed in
-- Voice input and output language-matched to the toggle
+| | Queue A | Queue B |
+|---|---------|---------|
+| **Direction** | `SensorTask` → `ProcessingTask` | `ProcessingTask`, `SupervisorTask`, `FaultCmdTask` → `LoggerTask` |
+| **Item type** | `SensorData` (temperature, humidity, timestamp, valid flag) | `LogMessage` (text up to 160 characters, timestamp) |
+| **Depth** | 5 | 10 |
+| **Sender behaviour** | Non-blocking (timeout 0). A failed send increments `g_queue_a_overflow_count` | `ProcessingTask` and `SupervisorTask` are non-blocking. `FaultCmdTask` waits up to 100 ms. Only a failed send from `ProcessingTask` increments `g_queue_b_overflow_count`; other dropped messages are not counted |
+| **Receiver behaviour** | `ProcessingTask` blocks for up to 500 ms | `LoggerTask` drains everything available each cycle |
 
----
+### Heartbeat monitoring
+
+1. Each monitored task writes `millis()` into its heartbeat record every cycle (together with a beat counter, inside one critical section).
+2. Every 2000 ms the supervisor takes a snapshot of each record and computes `age = millis() − last_beat_ms`.
+3. If `age` exceeds that task's timeout, the supervisor posts one `[FAULT]` message. When the age falls back within the timeout, it posts one `[RECOVERY]` message. It stays silent while the state is unchanged.
+
+**Detection timing.** The supervisor only evaluates heartbeats at its own 2 s checks, so a fault is reported at the first check *after* the timeout has been exceeded, not at the moment of the timeout. For the sensor (3000 ms timeout, 2000 ms checks) this means the reported heartbeat age falls between just over 3 s and 5 s, and the message then passes through Queue B and the logger, which adds up to about one logger period (200 ms). These figures are derived from the constants in [`include/config.h`](include/config.h), not measured. The first supervisor check happens about 2 s after the supervisor starts.
+
+**What a heartbeat proves.** A heartbeat shows that a task's loop reached its heartbeat statement recently. It does not prove the task's output is correct. The processing and logger tasks update their heartbeats *before* they wait on or drain their queues.
+
+### Shared data and synchronisation
+
+Fault-injection flags, overflow and invalid-reading counters, and heartbeat records are shared between tasks. Access to them is protected with **FreeRTOS critical sections** (`portENTER_CRITICAL` / `portEXIT_CRITICAL` using one shared `portMUX_TYPE` lock, `g_shared_mux`). Tasks copy the values they need into local variables inside the critical section and do their slower work (queue sends, string formatting, delays) outside it. The variables are also declared `volatile`, but the critical sections are what provide the protection. Sensor and log data passed between tasks goes through FreeRTOS queues, not shared variables. See the comments in [`include/config.h`](include/config.h).
+
+## Simulation Screenshots
+
+All captures are from the Wokwi simulator, with the Serial Monitor output shown in the terminal panel. Counters are cumulative since boot, so later captures include totals from earlier tests.
+
+### 1. Normal Operation
+
+![Normal operation: sensor readings and supervisor status lines with all tasks OK](docs/normal-operation.png)
+
+Sensor readings arrive about once per second and a `[SUPER]` status line about every two seconds, with all three monitored tasks `OK` and all counters at zero.
+
+### 2. Sensor Fault Detection
+
+![Sensor fault: SENSOR_STOP followed by an UNRESPONSIVE fault report](docs/sensor-fault.png)
+
+After `SENSOR_STOP` the sensor lines stop. In this run the command was received at t = 109872 ms and the `[FAULT]` line appeared at t = 113059 ms with a reported beat age of 4008 ms, which is the supervisor's check after the 3000 ms timeout was exceeded. `Sensor:FAIL` continues in the status lines while `Processing` and `Logger` stay `OK`.
+
+### 3. Sensor Recovery
+
+![Sensor recovery: SENSOR_RESUME followed by a RECOVERY message](docs/sensor-recovery.png)
+
+`SENSOR_RESUME` restores the heartbeat and data flow. The supervisor reports `[RECOVERY]` at its next check and the status line returns to `Sensor:OK`.
+
+### 4. Invalid Sensor Data
+
+![Invalid data: DATA-ERR lines and supervisor warnings after INVALID_DATA](docs/invalid-data.png)
+
+With `INVALID_DATA` on, each reading produces a `[DATA-ERR]` line while the sensor stays `OK` (its heartbeat is still being updated). The supervisor reports the running total in a `[WARN]` line once per check, not once per reading.
+
+### 5. Queue A Overflow
+
+![Queue A overflow: FAULT report and rising QA_OVF counter after QUEUE_STRESS](docs/queue-a-overflow.png)
+
+`QUEUE_STRESS` causes sends to Queue A to fail, and the supervisor reports `[FAULT] Queue A overflow!` with the lost-packet total, which also appears as `QA_OVF` in the status line. `INVALID_DATA` was still switched on when this was captured, which is why `[DATA-ERR]` lines are also visible.
+
+### 6. Queue B Overflow
+
+![Queue B overflow: burst of QUEUE-B-TEST messages after QUEUE_B_STRESS](docs/queue-b-overflow.png)
+
+`QUEUE_B_STRESS` makes `ProcessingTask` push bursts of `[QUEUE-B-TEST]` messages into Queue B for every reading. The earlier `QA_OVF` and `INV` totals are still shown in the status line because counters are not reset.
+
+## Quick Start
+
+### Prerequisites
+
+- [Visual Studio Code](https://code.visualstudio.com)
+- The **PlatformIO IDE** extension ([install guide](https://platformio.org/install/ide?install=vscode))
+- The **Wokwi Simulator** extension for VS Code ([getting started](https://docs.wokwi.com/vscode/getting-started)). It asks you to activate a licence on first use.
+
+### Run it
+
+```bash
+# 1. Clone the repository
+git clone https://github.com/ChandanaP30/RTOS-Sensor-Hub.git
+cd RTOS-Sensor-Hub
+
+# 2. Open it in VS Code
+code .
+
+# 3. Build the firmware (the first build downloads the toolchain and libraries)
+pio run
+```
+
+You can also build with the PlatformIO check-mark button in the status bar instead of `pio run`.
+
+4. Press **F1** and run **Wokwi: Start Simulator**. [`wokwi.toml`](wokwi.toml) tells Wokwi to load the firmware from `.pio/build/esp32dev/`, so step 3 must finish first.
+5. Open the simulator's Serial Monitor. You should see a startup banner, then a sensor line roughly every second and a `[SUPER]` status line every 2 seconds.
+
+Each log line is prefixed with a millisecond timestamp. The first lines look like this:
+
+```
+========================================
+  RTOS Sensor Hub — Runtime Task Health
+========================================
+Initialising FreeRTOS objects...
+
+[INIT] Queues created OK
+[INIT] All tasks created. Scheduler running.
+
+Type HELP for available commands.
+```
+
+Followed by lines of this form (illustrative; timestamps and exact order will differ):
+
+```
+[SENSOR]   T=25.5°C  H=60.0%  | t=<ms>ms
+[SUPER] t=<ms>ms | Sensor:OK Processing:OK Logger:OK | QA_OVF:0 QB_OVF:0 INV:0
+```
+
+The simulated DHT22 is set to 25.5 °C and 60.0 % in [`diagram.json`](diagram.json).
+
+## Serial Command Reference
+
+Type a command in the Wokwi Serial Monitor input box and press Enter. Commands are case-insensitive. The firmware echoes each command as `[INPUT] Received: <COMMAND>`, and replies to an unrecognised command with `Type HELP for the command list.`
+
+The command task starts polling Serial about one second after boot, so wait a moment after the simulator starts.
+
+| Command | Behaviour | Effect |
+|---------|-----------|--------|
+| `HELP` | action | Prints the command list |
+| `STATUS` | action | Prints every flag, the three counters, each task's beat count, and the age of the sensor's last heartbeat |
+| `SENSOR_STOP` | sets flag | `SensorTask` keeps looping at its normal period but skips its heartbeat update **and** its Queue A send. Simulates an unresponsive task; see the note below |
+| `SENSOR_RESUME` | clears flag | Ends `SENSOR_STOP` |
+| `SENSOR_SLOW` | sets flag | Inserts a 3000 ms delay at the start of each sensor cycle, giving an effective period of about 4 s |
+| `SENSOR_NORMAL` | clears flag | Ends `SENSOR_SLOW` |
+| `INVALID_DATA` | **toggle** | Sensor produces NaN readings; `ProcessingTask` flags them and counts them |
+| `QUEUE_STRESS` | **toggle** | After its normal send, `SensorTask` pushes 20 extra items into Queue A each cycle |
+| `QUEUE_B_STRESS` | **toggle** | For every reading it handles, `ProcessingTask` pushes 20 extra `[QUEUE-B-TEST]` messages into Queue B |
+| `RESET_FAULTS` | clears all | Clears all five fault flags. The overflow and invalid-reading counters are **not** reset |
+
+> [!IMPORTANT]
+> `SENSOR_STOP` **simulates** an unresponsive sensor task. It does not crash, delete or permanently hang the task. The task continues to loop; it just stops updating its heartbeat and stops sending data, which is what the supervisor is designed to notice. `SENSOR_RESUME` returns it to normal.
+
+## Fault-Injection Walkthrough
+
+Start the simulator and let it run for a few seconds so the system is in its normal state. Lines below omit the timestamp prefix, and `<N>` marks values that vary from run to run.
+
+### 1. Unresponsive sensor (`SENSOR_STOP`)
+
+1. Type `SENSOR_STOP`.
+2. The sensor lines stop appearing. The processing and logger tasks keep running and keep their heartbeats.
+3. At the supervisor's next check after the sensor's heartbeat is older than 3000 ms, you will see:
+   ```
+   [FAULT] *** SensorTask UNRESPONSIVE! Last beat <N>ms ago (timeout=3000ms) ***
+   [SUPER] t=<N>ms | Sensor:FAIL Processing:OK Logger:OK | QA_OVF:0 QB_OVF:0 INV:0
+   ```
+   The firmware's own reply to the command says "~3 s"; as described under [Heartbeat monitoring](#heartbeat-monitoring), the actual delay depends on where the supervisor's 2 s checks fall.
+4. Type `SENSOR_RESUME`. The sensor resumes on its next cycle, and the supervisor reports it at its next check:
+   ```
+   [RECOVERY] SensorTask is healthy again. Beat count=<N>
+   ```
+
+### 2. Slow sensor (`SENSOR_SLOW`)
+
+1. Type `SENSOR_SLOW`. The sensor now beats about every 4 s, which is longer than its 3 s timeout.
+2. Watch the `[SUPER]` lines. Because the sensor's 4 s period and the supervisor's 2 s checks line up in a fixed pattern that depends on timing at the moment you issue the command, the supervisor may report `[FAULT]` and `[RECOVERY]` alternately, or may not flag the sensor at all. This follows from the constants in `config.h` and is a consequence of the supervisor's polling interval; see [Limitations](#limitations).
+3. Type `SENSOR_NORMAL` to restore the normal 1 s period.
+
+### 3. Invalid readings (`INVALID_DATA`)
+
+1. Type `INVALID_DATA` (type it again to turn it off).
+2. The sensor still updates its heartbeat, so it stays `OK`, but every reading is invalid:
+   ```
+   [DATA-ERR] Invalid reading at <N>ms | Temp=nan | Hum=nan
+   ```
+3. At each supervisor check where the count has changed, you will also see:
+   ```
+   [WARN] Invalid sensor readings detected. Total: <N>
+   ```
+   This shows the difference between a task that is not responding and a task that is responding with bad data.
+
+### 4. Queue A overflow (`QUEUE_STRESS`)
+
+1. Type `QUEUE_STRESS` (again to turn it off).
+2. The sensor pushes one reading plus 20 extra copies per cycle into a queue of depth 5, while `ProcessingTask` removes at most one item per 500 ms period, so sends fail and are counted.
+3. At supervisor checks where the counter has changed:
+   ```
+   [FAULT] Queue A overflow! Total lost packets: <N>
+   ```
+
+### 5. Queue B overflow (`QUEUE_B_STRESS`)
+
+1. Type `QUEUE_B_STRESS` (again to turn it off).
+2. `ProcessingTask` sends a burst of `[QUEUE-B-TEST] Stress message #<n>` lines for every reading it handles. They are non-blocking sends, so once Queue B (depth 10) is full the rest are dropped and counted:
+   ```
+   [FAULT] Queue B overflow! Total lost log messages: <N>
+   ```
+3. `QA_OVF` stays unchanged in the `[SUPER]` line, so only Queue B is under pressure. Because the supervisor and command task also send through Queue B, some of their messages may be dropped while this fault is active.
+
+### 6. Clearing everything (`RESET_FAULTS`)
+
+Type `RESET_FAULTS`. All fault flags are cleared and the system returns to normal operation; if the sensor had been flagged, a `[RECOVERY]` line follows at the next supervisor check. Overflow and invalid-reading totals keep their values because they count events since boot.
+
+## Log Analyser
+
+[`log_analyser.py`](log_analyser.py) summarises a saved Serial log. It needs Python 3 and uses only the standard library.
+
+1. Run a session in Wokwi, then copy the Serial Monitor output into a text file named `serial_log.txt` in the project folder.
+2. Run:
+   ```bash
+   python log_analyser.py              # reads serial_log.txt
+   python log_analyser.py mylog.txt    # or give a file name
+   ```
+
+The report includes:
+
+- Count of valid and invalid readings, and min / max / average temperature and humidity
+- Sensor reading intervals (min, max, average) compared with the nominal 1000 ms
+- Number of `[FAULT]` and `[RECOVERY]` lines, and the beat age reported for each unresponsive task
+- Time from the first `SENSOR_STOP` command in the log to the first `UNRESPONSIVE` line
+- Maximum Queue A and Queue B overflow counts seen
+- The commands received, and how often each task was `OK` across supervisor cycles
+
+The analyser matches the exact log formats printed by the firmware with regular expressions, so if you change the log messages in `src/`, update the patterns at the top of the script too.
+
+## Configuration
+
+Timing, priorities, queue depths and thresholds are defined in [`include/config.h`](include/config.h).
+
+| Setting | Value |
+|---------|-------|
+| DHT22 data pin / type | GPIO 4 / DHT22 |
+| Serial baud rate | 115200 |
+| Queue depths | Queue A: 5, Queue B: 10 |
+| Log message length | 160 characters |
+| Task periods | Sensor 1000 ms, Processing 500 ms, Logger 200 ms, Supervisor 2000 ms |
+| Heartbeat timeouts | Sensor 3000 ms, Processing 2000 ms, Logger 1000 ms |
+| Task stack sizes (bytes) | Sensor 4096, Processing 3072, Logger 4096, Supervisor 3072, FaultCmd 3072 |
+| `SENSOR_SLOW` extra delay | 3000 ms |
+| Stress bursts | 20 items (Queue A), 20 items (Queue B) |
+
+The valid temperature (-40 to 80 °C) and humidity (0 to 100 %) limits are constants at the top of [`src/processing_task.cpp`](src/processing_task.cpp). Build settings (board `esp32dev`, Arduino framework, 115200 monitor speed, library dependencies) are in [`platformio.ini`](platformio.ini).
+
+## Hardware (Simulated)
+
+The circuit is defined in [`diagram.json`](diagram.json) and runs only in Wokwi. No physical wiring has been built or tested.
+
+| Part | Wokwi type | Connection |
+|------|------------|------------|
+| ESP32 DevKit V1 | `wokwi-esp32-devkit-v1` | n/a |
+| DHT22 sensor | `wokwi-dht22` | VCC to 3V3, GND to GND, SDA to GPIO 4 (`D4`) |
+| 10 kΩ resistor | `wokwi-resistor` | Between 3V3 and the DHT22 data line (pull-up) |
 
 ## Technology Stack
 
-### Frontend
-| Component | Technology |
-|-----------|-----------|
-| **Framework** | React 18 |
-| **Build Tool** | Vite |
-| **Maps** | Leaflet + React-Leaflet |
-| **Clustering** | Leaflet.MarkerCluster |
-| **Charts** | Recharts |
-| **Graph** | react-force-graph-2d |
-| **Icons** | Lucide React |
-| **PDF Export** | jsPDF + html2canvas |
-| **Styling** | Custom CSS with design tokens |
-| **Speech** | Web Speech API (native browser) |
-
-### Backend
-| Component | Technology |
-|-----------|-----------|
-| **Platform** | Zoho Catalyst (Serverless) |
-| **Runtime** | Node.js |
-| **Database** | Zoho Catalyst Data Store, queried via ZCQL — `CaseMaster`, `District`, `Unit`, `CCTVLocation`, `KBDocument`, `KBChunk`, `Officers`, plus lookup tables (`CaseStatusMaster`, `GravityOffence`, `CaseCategory`) |
-| **AI Model** | GLM model served via Catalyst QuickML, used for the chatbot and the Knowledge Base's grounded answers |
-| **Document Parsing** | pdf.js (PDF), mammoth (DOCX) |
-
-### Infrastructure
-| Component | Details |
-|-----------|---------|
-| **Deployment** | Zoho Catalyst development environment |
-| **Live URL** | `https://ksp-fir-platform-60073928681.development.catalystserverless.in` |
-| **Version Control** | Git / GitHub |
-
----
+| Area | Technology |
+|------|------------|
+| Microcontroller | ESP32 (DevKit V1 profile, simulated) |
+| RTOS | FreeRTOS, as bundled with the ESP32 Arduino core |
+| Language | C++ (Arduino framework) |
+| Sensor library | [Adafruit DHT sensor library](https://github.com/adafruit/DHT-sensor-library) `^1.4.6` and Adafruit Unified Sensor `^1.1.14` |
+| Build system | PlatformIO (`espressif32` platform) |
+| Simulation | Wokwi for VS Code |
+| Tooling | Python 3 (log analysis, standard library only) |
 
 ## Project Structure
 
 ```
-ksp-fir-platform/
-├── public/
-│   └── vite.svg
-│
-├── src/
-│   ├── App.jsx                  # Main application component + all sub-components
-│   │   (KpiCard, ClusterLayer, DistrictBoundaries, HotspotZoneLayer, CctvLayer,
-│   │    AnalyticsDrawer, MapLegend, PatrolRecommendationPanel, NetworkGraphPanel,
-│   │    KnowledgeBasePanel)
-│   ├── App.css                  # Styling
-│   ├── LoginPage.jsx             # Authentication screen
-│   ├── index.css                # Design tokens & global styles
-│   ├── main.jsx                  # React entry point
-│   ├── translations.js           # Kannada/English UI localization
-│   │
-│   ├── utils/
-│   │   └── districtNameMap.js    # GeoJSON ↔ database name mapping
-│   │
-│   └── assets/
-│       └── karnataka_districts.json  # GeoJSON district boundaries
-│
-├── functions/                    # Zoho Catalyst serverless functions
-│   ├── dashboard-function/
-│   ├── map-data-function/
-│   ├── ask-ai-function/
-│   ├── network-graph-function/
-│   ├── cctv-recommend-function/
-│   ├── patrol-recommend-function/
-│   ├── kb-function/
-│   ├── auth-function/
-│   ├── tts-function/
-│   ├── cleanup-function/
-│   └── cleanup-job-function/
-│
-├── index.html
-├── vite.config.js
-├── catalyst.json                 # Catalyst project/function registration
-├── package.json
-├── package-lock.json
-└── README.md
+RTOS-Sensor-Hub/
+├── platformio.ini            # Board, framework, library dependencies
+├── diagram.json              # Wokwi circuit (ESP32, DHT22, 10 kΩ resistor)
+├── wokwi.toml                # Points Wokwi at the built firmware
+├── log_analyser.py           # Offline Serial log analysis
+├── docs/                     # Wokwi simulation screenshots used in this README
+├── include/
+│   └── config.h              # Constants, shared structs, extern declarations
+└── src/
+    ├── main.cpp              # setup(), queue and task creation, global objects
+    ├── sensor_task.cpp       # DHT22 read, Queue A sender, heartbeat
+    ├── processing_task.cpp   # Validation, Queue B sender, heartbeat
+    ├── logger_task.cpp       # Serial output, heartbeat
+    ├── supervisor_task.cpp   # Heartbeat checks, fault and recovery reports
+    └── fault_controller.cpp  # Serial command handler, fault flags
 ```
-
-### Backend Functions (Zoho Catalyst)
-
-**Called directly from the frontend:**
-
-1. **`dashboard-function`** — KPI metrics
-   `GET /server/dashboard-function/` → `{ totalCases, underInvestigation, chargesheeted, closed, chargesheetRate }`
-
-2. **`map-data-function`** — Crime cases and districts
-   `GET /server/map-data-function/?type=districts|cases&district=&status=&crimeType=`
-
-3. **`ask-ai-function`** — AI chatbot with tool-calling
-   `POST /server/ask-ai-function/` with `{ question }` → `{ insight, reasoning[], recommendation, confidence, dashboardAction }`
-
-4. **`network-graph-function`** — Criminal network data and AI offender summaries
-   `GET /server/network-graph-function/`
-   `GET /server/network-graph-function/?offenderId=&mode=summary`
-
-5. **`cctv-recommend-function`** — CCTV recommendations and active cameras
-   `GET /server/cctv-recommend-function/?limit=20`
-   `GET /server/cctv-recommend-function/?mode=active`
-
-6. **`patrol-recommend-function`** — AI patrol plan generation
-   `GET /server/patrol-recommend-function/?district=&limit=30`
-
-7. **`kb-function`** — AI Knowledge Base (RAG)
-   `POST /server/kb-function/?mode=upload` — parse, chunk, and index a document
-   `GET /server/kb-function/?mode=list` — list indexed documents
-   `POST /server/kb-function/?mode=delete` — remove a document and its chunks
-   `POST /server/kb-function/?mode=query` — BM25 retrieval + grounded LLM answer with citations
-
-8. **`auth-function`** — Officer login (called from `LoginPage.jsx`)
-   `POST /server/auth-function/` with `{ action: "login", username, password }`
-
-**Deployed but not currently called by the frontend:**
-
-- **`tts-function`** — backend text-to-speech via Google's translate endpoint (built to guarantee Kannada audio regardless of the browser's installed voices). The current frontend uses the browser's native Web Speech API for voice output instead; this function remains available for a future re-integration.
-- **`cleanup-function`** / **`cleanup-job-function`** — scheduled data maintenance, not user-triggered.
-
----
-
-## Prerequisites
-
-### Required
-- **Node.js**: v18 or higher
-- **npm**: v8 or higher
-- **Git**
-- **Zoho Catalyst Account**: for backend deployment (`npm install -g zcatalyst-cli`)
-- **Modern Browser**: Chrome or Edge recommended (best Web Speech API support, including Kannada where available)
-
-### Optional
-- **Microphone**: for voice input
-- **Speakers**: for voice output
-
----
-
-## Setup & Installation
-
-### Step 1: Clone Repository
-
-```bash
-git clone https://github.com/<your-username>/ksp-fir-platform.git
-cd ksp-fir-platform
-```
-
-### Step 2: Install Frontend Dependencies
-
-```bash
-npm install
-```
-
-### Step 3: Configure the backend base URL
-
-The frontend points to a deployed Catalyst backend via a constant near the top of `src/App.jsx`:
-
-```javascript
-const FUNCTIONS_BASE = 'https://ksp-fir-platform-60073928681.development.catalystserverless.in/server';
-```
-
-If you deploy your own Catalyst project, update this to your own project's function base URL.
-
-### Step 4: Start the Development Server
-
-```bash
-npm run dev
-```
-
-The app opens at `http://localhost:5173/` (or the port Vite reports).
-
-### Step 5: Build for Production
-
-```bash
-npm run build
-```
-
-Output goes to the `dist/` directory.
-
----
-
-## Development
-
-### Running Development Server
-
-```bash
-npm run dev
-```
-
-Hot-reload enabled — changes to `.jsx`/`.css`/`.js` auto-refresh.
-
-### Linting
-
-```bash
-npm run lint
-```
-
-### Design Tokens
-
-Defined in `src/index.css` and used throughout `App.css` — colors, spacing, radii, shadows, and z-index scales. Reuse these tokens (`var(--accent)`, `var(--spacing-lg)`, etc.) rather than hardcoding new values when extending the UI.
-
----
-
-## Deployment
-
-### Zoho Catalyst (this project's deployment target)
-
-**Prerequisites**: a Zoho account with Catalyst access, and the Catalyst CLI installed.
-
-```bash
-catalyst login
-```
-
-**Deploy the frontend (Slate) and all functions:**
-```bash
-catalyst deploy
-```
-
-**Deploy only functions** (faster iteration when only backend code changed):
-```bash
-catalyst deploy --only functions
-```
-
-Which functions get deployed is controlled by the `targets` array in `catalyst.json` at the project root — every function folder under `functions/` that should be live must be listed there.
-
-**Verify:**
-```bash
-catalyst open
-```
-
-> **Note for this submission**: per the Datathon rules, the deployed solution link must be a **Zoho Catalyst** deployment — this project is built and configured specifically for that target.
-
----
-
-## API Documentation
-
-### Base URL
-```
-https://ksp-fir-platform-60073928681.development.catalystserverless.in/server
-```
-
-### AI Chatbot Query
-**`POST /ask-ai-function/`**
-
-Request:
-```json
-{ "question": "Show theft cases in Bengaluru Urban" }
-```
-
-Response:
-```json
-{
-  "insight": "Bengaluru Urban has 342 theft cases, with 156 currently under investigation.",
-  "reasoning": ["Total matching cases: 342.", "156 are still under investigation."],
-  "recommendation": "Consider increasing CCTV coverage in the highest-density areas.",
-  "confidence": 85,
-  "dashboardAction": { "type": "filterDistrict", "district": "Bengaluru Urban" }
-}
-```
-
-`dashboardAction.type` can be `filterDistrict`, `filterCrimeType`, `filterStatus`, `showHotspots`, `showCCTV`, or `none`.
-
-### Knowledge Base Query
-**`POST /kb-function/?mode=query`**
-
-Request:
-```json
-{ "question": "What is the procedure for cyber fraud investigation?", "preferredLang": "en" }
-```
-
-Response:
-```json
-{
-  "answer": "...",
-  "groundedInKB": true,
-  "citations": [{ "documentName": "cyber_fraud_sop.pdf", "source": "Page 1" }]
-}
-```
-
-### Patrol Recommendations
-**`GET /patrol-recommend-function/?district=<rowId>&limit=30`**
-
-Response includes `totalHotspots`, `highPriorityCount`, `lowPriorityCount`, and a `recommendations[]` array with per-area officer counts, patrol timing, nearby CCTV context, and an explanation.
-
-### KPI Dashboard
-**`GET /dashboard-function/`** → `{ totalCases, underInvestigation, chargesheeted, closed, chargesheetRate }`
-
-### Crime Cases & Districts
-**`GET /map-data-function/?type=cases|districts&district=&status=&crimeType=`**
-
-### CCTV Recommendations & Active Cameras
-**`GET /cctv-recommend-function/?limit=20`** and **`?mode=active`**
-
-### Criminal Network
-**`GET /network-graph-function/`** and **`?offenderId=&mode=summary`**
-
-### Officer Login
-**`POST /auth-function/`** with `{ "action": "login", "username": "...", "password": "..." }`
-
----
-
-## Features Guide
-
-### Dashboard Tab
-- Select District / Status / Crime Type filters — map, KPIs, and analytics all update live
-- Toggle CCTV recommendation and active-camera layers; adjust the recommendation limit
-- Click "Analytics" to expand the trend/hotspot/resolution charts
-
-### AI Chatbot (side panel, any tab)
-- Type a question or click a suggested prompt
-- Click the microphone to ask by voice (English or Kannada, based on the language toggle)
-- Click 🔊 to hear the answer read aloud
-- Open History to revisit past questions or export the full conversation as a PDF
-
-### Knowledge Base Tab
-- Upload SOPs/circulars/manuals as PDF, DOCX, or TXT
-- Ask questions by text or voice — answers cite the specific document and page/section they came from
-- If nothing relevant is uploaded, the assistant says so rather than guessing
-
-### AI Patrol Recommendation Tab
-- Filter by district and click "Generate Patrol Plan"
-- Each recommendation card shows officer count, suggested patrol window, nearby CCTV context, recent crime count, and a confidence score
-
-### Criminal Network Tab
-- Filter by district, crime type, year, or offender name
-- Click a node to see linked cases and generate an AI summary of that offender's pattern
-
----
 
 ## Troubleshooting
 
-### Map not loading
-- Check the browser console (F12) for errors
-- Hard refresh (Ctrl+Shift+R) to rule out stale cached assets
+| Problem | What to try |
+|---------|-------------|
+| Wokwi cannot find the firmware | Run `pio run` first. Wokwi loads `.pio/build/esp32dev/firmware.bin` (see [`wokwi.toml`](wokwi.toml)) |
+| `pio` is not recognised in a terminal | Use a terminal opened from the PlatformIO extension, or the build button in the VS Code status bar |
+| First build is slow or fails to download | PlatformIO downloads the ESP32 toolchain and libraries on first use and needs an internet connection |
+| Wokwi asks for a licence | Follow the activation prompt from the Wokwi extension (see its [getting-started guide](https://docs.wokwi.com/vscode/getting-started)) |
+| Typed commands get no response | Wait a second after boot, click into the Serial Monitor input box, and press Enter after the command |
+| `Unknown command` reply | Check the spelling against [the command table](#serial-command-reference); commands are case-insensitive but names must match exactly |
+| A message you expected is missing from the log | Supervisor and command messages are dropped if Queue B is full (see [Limitations](#limitations)) |
 
-### AI chatbot / Knowledge Base / Patrol panel returns an error or generic fallback
-- Confirm the relevant Catalyst function is deployed (`catalyst deploy --only functions`)
-- Check that function's logs in the Catalyst console for the actual error
-- Verify `FUNCTIONS_BASE` in `App.jsx` points to your deployed project
+## Limitations
 
-### Kannada text displays as boxes
-- Use a recent version of Chrome or Edge
-- For PDF export specifically, the app loads the Noto Sans Kannada web font before rendering — a slow/blocked network connection to Google Fonts can affect this
+- **Simulation only.** The project has been developed and tested in Wokwi, not on physical hardware. Real DHT22 timing and failure modes, real UART timing and real scheduler behaviour have not been evaluated. Timing values observed in the simulator should not be treated as representative of a real board, and this README reports no timing measurements.
+- **No timing guarantees.** Tasks are scheduled periodically with FreeRTOS, but the project does not claim deterministic or jitter-free behaviour and has not measured jitter.
+- **Detection granularity.** The supervisor polls every 2 s, so fault reports are quantised to its check times (see [Heartbeat monitoring](#heartbeat-monitoring)). With the current constants, `SENSOR_SLOW` (about 4 s per heartbeat against a 3 s timeout) can be reported as alternating fault/recovery or can go unflagged, depending on how the checks line up. Detecting slower-than-expected tasks reliably would need a shorter polling period, a different timeout, or a different method.
+- **Detection and reporting only.** The supervisor does not restart or repair a task. Task handles are not stored, so there is no restart path.
+- **Simulated faults only.** `SENSOR_STOP` and the other injected faults are controlled by flags in the code. Real failures such as a genuine hang, deadlock or stack overflow have not been tested.
+- **Limited coverage.** Only the sensor, processing and logger tasks have heartbeats. The supervisor and command tasks are not monitored, and no hardware watchdog is used, so nothing detects a stalled supervisor.
+- **Liveness, not correctness.** A heartbeat shows a task is reaching its heartbeat point. Output correctness is checked only through the processing task's validity tests.
+- **Dropped diagnostics under load.** Supervisor messages are sent without waiting, and command-task messages wait at most 100 ms, so either can be dropped if Queue B is full. The Queue B overflow counter only counts failed sends from `ProcessingTask`, not these dropped messages.
+- **Cumulative counters.** Overflow and invalid-reading counters count events since boot and are not reset by `RESET_FAULTS`.
+- **Log-format dependency.** `log_analyser.py` parses the firmware's current message formats and must be updated if they change.
+- **Toolchain not pinned.** `platformio.ini` does not pin the `espressif32` platform version, so future platform releases may change build behaviour.
+- **Not certified.** This is an educational project. It has not been certified or validated for safety-critical use.
 
-### Voice input or output doesn't work for Kannada
-- This is a genuine platform limitation: browser support for Kannada speech recognition/synthesis varies by OS and browser. Chrome on Android tends to have the best coverage. The app detects a missing Kannada voice and shows a clear message rather than silently failing in the wrong language.
+## Possible Future Improvements
 
-### Login page appears blank
-- Confirm `LoginPage.jsx` exists in `src/` and is imported in `App.jsx`
-- Clear `localStorage` (`localStorage.clear()` in the console) if a stale session object is causing issues
-
----
-
-## Contributing
-
-### Code Style
-- 2-space indentation
-- Follow the existing ESLint configuration
-- Reuse existing design tokens rather than introducing new hardcoded values
-
-### Making Changes
-
-```bash
-git checkout -b feature/your-feature-name
-# make changes
-npm run lint
-npm run dev   # test locally
-git add .
-git commit -m "feat: describe your change"
-git push
-```
-
----
-
-## Support & Resources
-
-- **Catalyst Docs**: https://catalyst.zoho.com/help/
-- **React Docs**: https://react.dev
-- **Leaflet Docs**: https://leafletjs.com
-- **Vite Docs**: https://vitejs.dev
-
----
-
-## License
-
-MIT License
-
----
-
-## Changelog
-
-### Version 1.0.0 (July 26, 2026)
-- Initial release for KSP Datathon 2026
-- KPI dashboard, interactive crime map with clustering and hotspot zones
-- AI chatbot with tool-calling, bilingual (English/Kannada), voice input/output, PDF export
-- AI Knowledge Base (RAG) with document upload, BM25 retrieval, and grounded citations
-- AI Patrol Recommendation engine
-- CCTV recommendation engine (priority-based)
-- Criminal network graph visualization
-- Officer authentication with role-based accounts
-- Full Kannada + English multi-language support throughout
-
----
-
-## Quick Links
-
-- 🚀 **Live Platform**: https://ksp-fir-platform-60073928681.development.catalystserverless.in
-- 📦 **GitHub**: `<add your repository URL here>`
-
----
-
-**Made for Karnataka State Police | KSP Datathon 2026**
+- Validate the firmware on a physical ESP32 with a real DHT22 and record real timing behaviour.
+- Store task handles so the supervisor can restart a failed task.
+- Use the ESP32 hardware or task watchdog so a stalled supervisor is also detected.
+- Reduce the supervisor's polling period or add per-task slow-cycle detection to improve detection of slow tasks.
+- Log fault events to non-volatile storage (NVS or SPIFFS) so they survive a reset.
+- Monitor stack usage with `uxTaskGetStackHighWaterMark()`.
+- Add a `RESET_COUNTERS` command.
+- Add LED status indicators, or send fault data to an MQTT broker.
+- Replace polling with FreeRTOS software timers where appropriate.
